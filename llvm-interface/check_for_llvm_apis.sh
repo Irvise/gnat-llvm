@@ -4,6 +4,7 @@ set -u
 # Usage: check_for_llvm_api.sh "path/to/llvm-config"
 
 llvm_config="$1"
+cxx="${CXX:-g++}"
 
 cxxflags=$($llvm_config --cxxflags)
 ldflags=$($llvm_config  --libs all --ldflags --system-libs)
@@ -26,7 +27,7 @@ using namespace llvm;
 $program
 EOF
 
-    if gcc $cxxflags $ldflags --syntax-only $filename 2> /dev/null; then
+    if $cxx $cxxflags $ldflags --syntax-only $filename 2> /dev/null; then
 	echo "#define GNAT_LLVM_$defname" >obj/def_${defname}.h
     fi
 
@@ -57,7 +58,7 @@ int main ()
 }
 EOF
 
-    if g++ $cxxflags $filename $ldflags -o $exe; then
+    if $cxx $cxxflags $filename $ldflags -o $exe; then
 	export LD_LIBRARY_PATH=$($llvm_config --libdir):$LD_LIBRARY_PATH
 	if $exe ; then
 	    echo "#define GNAT_LLVM_$defname" >obj/def_${defname}.h
