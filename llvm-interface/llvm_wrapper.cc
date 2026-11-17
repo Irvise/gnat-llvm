@@ -49,7 +49,8 @@
 #include "llvm/TargetParser/AArch64TargetParser.h"
 #include "llvm/TargetParser/RISCVISAInfo.h"
 #include "llvm/TargetParser/RISCVTargetParser.h"
-#include "llvm/Transforms/IPO.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
@@ -59,7 +60,12 @@
 #include "llvm/Transforms/Scalar/LoopRotation.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
+#include "llvm/Frontend/Offloading/OffloadWrapper.h"
 #include "llvm/Frontend/Offloading/Utility.h"
+#include "llvm/Object/OffloadBinary.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticIDs.h"
@@ -2244,7 +2250,9 @@ Constant *Get_OpenMP_Target_Ident(Module *M) {
   Type *Ptr = PointerType::getUnqual(Ctx);
   StructType *IdentTy = StructType::get(I32, I32, I32, I32, Ptr);
 
-  Constant *Src = ConstantDataArray::getString(Ctx, "gnat-openmp", true);
+  // OpenMP source-info format expected by libomptarget: ;file;func;line;col;;
+  Constant *Src = ConstantDataArray::getString(
+      Ctx, ";unknown;unknown;0;0;;", true);
   auto *SrcGV = new GlobalVariable(*M, Src->getType(), true,
                                    GlobalValue::InternalLinkage, Src,
                                    "gnat.omp.target.source");
@@ -2310,6 +2318,182 @@ void Ensure_OpenMP_Registration(Module *M) {
     new GlobalVariable(*M, AT, false, GlobalValue::AppendingLinkage,
                        ConstantArray::get(AT, {Entry}), "llvm.global_ctors");
   }
+}
+
+// Emit a device image for the outlined region and register it with
+// libomptarget.  The current implementation builds a host (x86_64) image, so
+// the runtime's host plugin executes the kernel; the same machinery can emit
+// amdgcn/nvptx images once a device toolchain is available.
+// Best-effort size of the object a mapped pointer refers to.
+static uint64_t Infer_Mapped_Size(Value *V, const DataLayout &DL) {
+  if (auto *AI = dyn_cast<AllocaInst>(V))
+    return DL.getTypeAllocSize(AI->getAllocatedType());
+  if (auto *GV = dyn_cast<GlobalVariable>(V))
+    return DL.getTypeAllocSize(GV->getValueType());
+  if (auto *BC = dyn_cast<BitCastOperator>(V))
+    return Infer_Mapped_Size(BC->getOperand(0), DL);
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return Infer_Mapped_Size(GEP->getPointerOperand(), DL);
+  return 0;
+}
+
+static bool Emit_OpenMP_Device_Image(Module *M, Function *E,
+                                     GlobalVariable *RegionId,
+                                     StringRef KernelName, unsigned NArgs) {
+  LLVMContext &Ctx = M->getContext();
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *Void = Type::getVoidTy(Ctx);
+  FunctionType *EFT = E->getFunctionType();
+
+  if (EFT->getNumParams() != NArgs || NArgs == 0)
+    return false;
+  for (Type *T : EFT->params())
+    if (!T->isPointerTy())
+      return false;
+
+  // Clone the whole module (cross-module CloneFunctionInto crashes LLVM 21),
+  // then prune everything except the kernel with GlobalDCE.
+  ValueToValueMapTy VMap;
+  std::unique_ptr<Module> DM = CloneModule(*M, VMap);
+  DM->setModuleIdentifier("gnat.omp.device");
+  DM->setTargetTriple(Triple(StringRef("x86_64-pc-linux-gnu")));
+  DM->setDataLayout(M->getDataLayout());
+  if (GlobalVariable *G = DM->getNamedGlobal("llvm.global_ctors"))
+    G->eraseFromParent();
+  if (GlobalVariable *G = DM->getNamedGlobal("llvm.used"))
+    G->eraseFromParent();
+
+  Function *DE = cast<Function>(VMap[E]);
+  DE->setLinkage(GlobalValue::InternalLinkage);
+
+  // Device-side range helpers: the host kernel executes the whole range.
+  for (const char *Name : {"gnat.omp.thread_low", "gnat.omp.thread_high"}) {
+    Function *F = DM->getFunction(Name);
+    if (!F)
+      continue;
+    bool High = StringRef(Name).ends_with("high");
+    F->deleteBody();
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    B.CreateRet(High ? F->getArg(1) : F->getArg(0));
+  }
+
+  // libomptarget (kernel-arg ABI v3) prepends an implicit kernel launch
+  // environment pointer, so the device kernel takes one extra leading ptr.
+  SmallVector<Type *, 8> KParams = {Ptr};
+  for (Type *T : EFT->params())
+    KParams.push_back(T);
+  Function *K = Function::Create(
+      FunctionType::get(Void, KParams, false), GlobalValue::ExternalLinkage,
+      KernelName, DM.get());
+  IRBuilder<> KB(BasicBlock::Create(Ctx, "entry", K));
+  SmallVector<Value *, 8> Fwd;
+  for (unsigned I = 0; I < EFT->getNumParams(); ++I)
+    Fwd.push_back(K->getArg(I + 1));
+  KB.CreateCall(DE, Fwd);
+  KB.CreateRetVoid();
+
+  // Keep only functions reachable from the kernel (the host module was cloned
+  // in full so we do not depend on cross-module cloning or a DCE pass).
+  SmallPtrSet<Function *, 32> Live;
+  SmallVector<Function *, 32> Work{K};
+  while (!Work.empty()) {
+    Function *F = Work.pop_back_val();
+    if (!Live.insert(F).second)
+      continue;
+    for (BasicBlock &BB : *F)
+      for (Instruction &I : BB)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (Function *Callee = CB->getCalledFunction())
+            Work.push_back(Callee);
+  }
+  for (Function &F : llvm::make_early_inc_range(*DM))
+    if (!F.isDeclaration() && !Live.count(&F))
+      F.eraseFromParent();
+  for (GlobalVariable &G : llvm::make_early_inc_range(DM->globals()))
+    if (!G.isDeclaration() && G.hasLocalLinkage() && G.use_empty())
+      G.eraseFromParent();
+
+  // Compile the device module for the host triple.
+  std::string Err;
+  Triple TT(StringRef("x86_64-pc-linux-gnu"));
+  const Target *T = TargetRegistry::lookupTarget(TT, Err);
+  if (!T)
+    return false;
+  llvm::TargetOptions Opt;
+  std::optional<Reloc::Model> RM(Reloc::PIC_);
+  std::unique_ptr<TargetMachine> TM(
+      T->createTargetMachine(TT, "generic", "", Opt, RM));
+  if (!TM)
+    return false;
+  SmallVector<char, 0> Obj;
+  raw_svector_ostream OS(Obj);
+  legacy::PassManager PM;
+  if (TM->addPassesToEmitFile(PM, OS, nullptr, CodeGenFileType::ObjectFile))
+    return false;
+  PM.run(*DM);
+
+  // The host plugin dlopen()s the image, so it must be a shared object, not a
+  // relocatable object.  Write the object out and link it with the system
+  // linker driver (the only external tool this lowering needs).
+  SmallString<128> ObjPath;
+  int FD = -1;
+  if (sys::fs::createTemporaryFile("gnat-omp-dev", "o", FD, ObjPath))
+    return false;
+  {
+    raw_fd_ostream OF(FD, true);
+    OF.write(Obj.data(), Obj.size());
+  }
+  SmallString<128> SoPath(ObjPath);
+  SoPath += ".so";
+  auto ClangOrErr = sys::findProgramByName("clang");
+  if (!ClangOrErr)
+    ClangOrErr = sys::findProgramByName("clang-21");
+  if (!ClangOrErr) {
+    sys::fs::remove(ObjPath);
+    return false;
+  }
+  std::string ClangPath = *ClangOrErr;
+  SmallVector<StringRef, 8> LinkArgs = {ClangPath, "-shared", "-nostdlib",
+                                        "-o", SoPath.str(), ObjPath.str()};
+  std::string ExecErr;
+  int RC = sys::ExecuteAndWait(ClangPath, LinkArgs, std::nullopt, {}, 0, 0,
+                               &ExecErr);
+  if (RC != 0) {
+    sys::fs::remove(ObjPath);
+    return false;
+  }
+  auto SoOrErr = MemoryBuffer::getFile(SoPath.str());
+  if (!SoOrErr) {
+    sys::fs::remove(ObjPath);
+    return false;
+  }
+  std::unique_ptr<MemoryBuffer> SoBuf = std::move(*SoOrErr);
+
+  object::OffloadBinary::OffloadingImage Img;
+  Img.TheImageKind = object::IMG_Object;
+  Img.TheOffloadKind = object::OFK_OpenMP;
+  Img.Flags = 0;
+  Img.StringData["triple"] = "x86_64-pc-linux-gnu";
+  Img.StringData["arch"] = "x86_64";
+  Img.Image = std::move(SoBuf);
+  SmallString<0> Bytes = object::OffloadBinary::write(Img);
+  sys::fs::remove(ObjPath);
+  sys::fs::remove(SoPath);
+
+  // Host offload entry: the runtime matches the region id passed to
+  // __tgt_target_kernel with this entry and looks up the kernel by name.
+  auto EntriesB = offloading::getOffloadEntryArray(*M, "omp_offloading_entries");
+  offloading::emitOffloadingEntry(*M, object::OFK_OpenMP, RegionId, KernelName,
+                                  0, 0, 0, nullptr, "omp_offloading_entries");
+
+  SmallVector<ArrayRef<char>, 1> Images;
+  Images.push_back(ArrayRef<char>(Bytes.data(), Bytes.size()));
+  if (Error E2 = offloading::wrapOpenMPBinaries(*M, Images, EntriesB)) {
+    consumeError(std::move(E2));
+    return false;
+  }
+  return true;
 }
 
 Constant *Get_OpenMP_Ident(Module *M) {
@@ -2553,14 +2737,30 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
 
   // Target region: dispatch through libomptarget's __tgt_target_kernel and
   // fall back to the host team when the runtime reports no device image.
-  Ensure_OpenMP_Registration(M);
   Constant *TgtIdent = Get_OpenMP_Target_Ident(M);
   Type *I64 = Type::getInt64Ty(Ctx);
   Type *I8 = Type::getInt8Ty(Ctx);
 
+  static unsigned Kernel_Count = 0;
+  std::string Suffix = std::to_string(Kernel_Count++);
   auto *RegionId = new GlobalVariable(
       *M, I8, true, GlobalValue::InternalLinkage,
-      ConstantInt::get(I8, 0), "gnat.omp.region.id");
+      ConstantInt::get(I8, 0), "gnat.omp.region.id." + Suffix);
+  std::string KernelName = "gnat_omp_kernel_" + Suffix;
+
+  SmallVector<uint64_t, 8> MappedSizes;
+  bool SizesKnown = HostCall->arg_size() > 0;
+  for (Value *Arg : HostCall->args()) {
+    uint64_t S = Infer_Mapped_Size(Arg, M->getDataLayout());
+    if (S == 0)
+      SizesKnown = false;
+    MappedSizes.push_back(S);
+  }
+
+  if (!SizesKnown
+      || !Emit_OpenMP_Device_Image(M, E, RegionId, KernelName,
+                                   HostCall->arg_size()))
+    Ensure_OpenMP_Registration(M);
 
   unsigned NArgs = HostCall->arg_size();
   BasicBlock *Orig = HostCall->getParent();
@@ -2582,10 +2782,11 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
     B.CreateStore(Arg, BP);
     Value *SP = B.CreateInBoundsGEP(I64Arr, Sizes,
                                     {B.getInt32(0), B.getInt32(Index)});
-    B.CreateStore(Zero64, SP);
+    B.CreateStore(ConstantInt::get(
+                      I64, SizesKnown ? MappedSizes[Index] : 0), SP);
     Value *MP = B.CreateInBoundsGEP(I64Arr, MapT,
                                     {B.getInt32(0), B.getInt32(Index)});
-    B.CreateStore(Zero64, MP);
+    B.CreateStore(ConstantInt::get(I64, SizesKnown ? 35 : 0), MP);
     ++Index;
   }
 
