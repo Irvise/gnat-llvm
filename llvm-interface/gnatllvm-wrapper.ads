@@ -87,7 +87,8 @@ package GNATLLVM.Wrapper is
    function Outline_Parallel_For
      (Header      : Basic_Block_T;
       Num_Threads : unsigned;
-      Reversed    : unsigned) return unsigned
+      Reversed    : unsigned;
+      Is_Target   : unsigned) return unsigned
      with Import, Convention => C, External_Name => "Outline_Parallel_For";
    --  Outline the loop headed by Header into a libomp microtask and replace it
    --  with __kmpc_fork_call.  Returns 1 on success.

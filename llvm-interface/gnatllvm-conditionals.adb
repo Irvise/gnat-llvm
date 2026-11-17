@@ -1627,7 +1627,8 @@ package body GNATLLVM.Conditionals is
          begin
             Ignored := Outline_Parallel_For
               (BB_Start, unsigned (OpenMP_Threads),
-               (if Parallel_Reversed then 1 else 0));
+               (if Parallel_Reversed then 1 else 0),
+               (if OpenMP_Dir = OpenMP_Target then 1 else 0));
          end;
       end if;
 

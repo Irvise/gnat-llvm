@@ -59,6 +59,7 @@
 #include "llvm/Transforms/Scalar/LoopRotation.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
+#include "llvm/Frontend/Offloading/Utility.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticIDs.h"
@@ -2234,6 +2235,83 @@ Value *Range_Call(Module *M, bool High, Value *Lo, Value *Hi, Type *Ty,
   return B.CreateSExtOrTrunc(C, Ty);
 }
 
+Constant *Get_OpenMP_Target_Ident(Module *M) {
+  if (GlobalVariable *G = M->getNamedGlobal("gnat.omp.target.ident"))
+    return G;
+
+  LLVMContext &Ctx = M->getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  StructType *IdentTy = StructType::get(I32, I32, I32, I32, Ptr);
+
+  Constant *Src = ConstantDataArray::getString(Ctx, "gnat-openmp", true);
+  auto *SrcGV = new GlobalVariable(*M, Src->getType(), true,
+                                   GlobalValue::InternalLinkage, Src,
+                                   "gnat.omp.target.source");
+  Constant *SrcPtr = ConstantExpr::getBitCast(SrcGV, Ptr);
+  // flags = 2 marks the region as requiring an OpenMP device.
+  Constant *Init = ConstantStruct::get(
+      IdentTy, {ConstantInt::get(I32, 0), ConstantInt::get(I32, 2),
+                ConstantInt::get(I32, 0), ConstantInt::get(I32, 0), SrcPtr});
+  return new GlobalVariable(*M, IdentTy, true, GlobalValue::InternalLinkage,
+                            Init, "gnat.omp.target.ident");
+}
+
+// Register an (initially empty) libomptarget binary descriptor so that
+// __tgt_target_kernel works and reports "no image" instead of crashing.  A
+// device image is added later when the offload toolchain is wired in.
+void Ensure_OpenMP_Registration(Module *M) {
+  if (M->getNamedGlobal("gnat.omp.bin.desc"))
+    return;
+
+  LLVMContext &Ctx = M->getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *Void = Type::getVoidTy(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  Constant *Null = ConstantPointerNull::get(cast<PointerType>(Ptr));
+
+  StructType *EntryTy = offloading::getEntryTy(*M);
+  Type *EntryPtr = PointerType::getUnqual(Ctx);
+  StructType *ImgTy =
+      StructType::get(Ctx, {Ptr, Ptr, EntryPtr, EntryPtr});
+  StructType *DescTy =
+      StructType::get(Ctx, {I32, Ptr, EntryPtr, EntryPtr});
+
+  auto *Desc = new GlobalVariable(
+      *M, DescTy, false, GlobalValue::InternalLinkage,
+      ConstantStruct::get(DescTy,
+                          {ConstantInt::get(I32, 0), Null, Null, Null}),
+      "gnat.omp.bin.desc");
+
+  FunctionCallee Reg = M->getOrInsertFunction(
+      "__tgt_register_lib",
+      FunctionType::get(Void, {Ptr}, false));
+  Function *Ctor = Function::Create(FunctionType::get(Void, false),
+                                    GlobalValue::InternalLinkage,
+                                    "gnat.omp.register", M);
+  IRBuilder<> CB(BasicBlock::Create(Ctx, "entry", Ctor));
+  CB.CreateCall(Reg, {Desc});
+  CB.CreateRetVoid();
+
+  StructType *CtorTy = StructType::get(Ctx, {I32, Ptr, Ptr});
+  Constant *Entry = ConstantStruct::get(
+      CtorTy, {ConstantInt::get(I32, 65535), Ctor, Null});
+  if (GlobalVariable *Ctors = M->getNamedGlobal("llvm.global_ctors")) {
+    auto *Old = cast<ConstantArray>(Ctors->getInitializer());
+    SmallVector<Constant *, 8> Vals;
+    for (Value *Op : Old->operands())
+      Vals.push_back(cast<Constant>(Op));
+    Vals.push_back(Entry);
+    ArrayType *AT = ArrayType::get(CtorTy, Vals.size());
+    Ctors->setInitializer(ConstantArray::get(AT, Vals));
+    Ctors->mutateType(PointerType::getUnqual(Ctx));
+  } else {
+    ArrayType *AT = ArrayType::get(CtorTy, 1);
+    new GlobalVariable(*M, AT, false, GlobalValue::AppendingLinkage,
+                       ConstantArray::get(AT, {Entry}), "llvm.global_ctors");
+  }
+}
+
 Constant *Get_OpenMP_Ident(Module *M) {
   if (GlobalVariable *G = M->getNamedGlobal("gnat.omp.ident"))
     return G;
@@ -2278,7 +2356,8 @@ BasicBlock *Find_Return_Block(Function *F) {
 // already happened, which is still correct).
 extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
                                     unsigned Num_Threads,
-                                    unsigned Reversed) {
+                                    unsigned Reversed,
+                                    unsigned Is_Target) {
   auto *Header = dyn_cast<BasicBlock>(unwrap(Header_Ref));
   if (!Header)
     return 0;
@@ -2447,22 +2526,113 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
       "__kmpc_fork_call", FunctionType::get(Void, {Ptr, I32, Ptr}, true));
   Constant *Ident = Get_OpenMP_Ident(M);
 
-  IRBuilder<> HB(HostCall);
-  if (Num_Threads > 0) {
-    FunctionCallee GTid = M->getOrInsertFunction(
-        "__kmpc_global_thread_num", FunctionType::get(I32, {Ptr}, false));
-    Value *Tid = HB.CreateCall(GTid, {Ident});
-    FunctionCallee Push = M->getOrInsertFunction(
-        "__kmpc_push_num_threads",
-        FunctionType::get(Void, {Ptr, I32, I32}, false));
-    HB.CreateCall(Push, {Ident, Tid, ConstantInt::get(I32, Num_Threads)});
-  }
-
   SmallVector<Value *, 8> ForkArgs = {
       Ident, ConstantInt::get(I32, HostCall->arg_size()), W};
   for (Value *Arg : HostCall->args())
     ForkArgs.push_back(Arg);
-  HB.CreateCall(Fork, ForkArgs);
+
+  auto add_thread_push = [&](IRBuilder<> &B) {
+    if (Num_Threads > 0) {
+      FunctionCallee GTid = M->getOrInsertFunction(
+          "__kmpc_global_thread_num", FunctionType::get(I32, {Ptr}, false));
+      Value *Tid = B.CreateCall(GTid, {Ident});
+      FunctionCallee Push = M->getOrInsertFunction(
+          "__kmpc_push_num_threads",
+          FunctionType::get(Void, {Ptr, I32, I32}, false));
+      B.CreateCall(Push, {Ident, Tid, ConstantInt::get(I32, Num_Threads)});
+    }
+  };
+
+  if (!Is_Target) {
+    IRBuilder<> HB(HostCall);
+    add_thread_push(HB);
+    HB.CreateCall(Fork, ForkArgs);
+    HostCall->eraseFromParent();
+    return 1;
+  }
+
+  // Target region: dispatch through libomptarget's __tgt_target_kernel and
+  // fall back to the host team when the runtime reports no device image.
+  Ensure_OpenMP_Registration(M);
+  Constant *TgtIdent = Get_OpenMP_Target_Ident(M);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *I8 = Type::getInt8Ty(Ctx);
+
+  auto *RegionId = new GlobalVariable(
+      *M, I8, true, GlobalValue::InternalLinkage,
+      ConstantInt::get(I8, 0), "gnat.omp.region.id");
+
+  unsigned NArgs = HostCall->arg_size();
+  BasicBlock *Orig = HostCall->getParent();
+  BasicBlock *Cont = Orig->splitBasicBlock(HostCall, "omp.target.cont");
+  Instruction *OldBr = Orig->getTerminator();
+
+  IRBuilder<> B(OldBr);
+  unsigned ASize = NArgs ? NArgs : 1;
+  Type *PtrArr = ArrayType::get(Ptr, ASize);
+  Type *I64Arr = ArrayType::get(I64, ASize);
+  AllocaInst *Base = B.CreateAlloca(PtrArr, nullptr, "omp.base");
+  AllocaInst *Sizes = B.CreateAlloca(I64Arr, nullptr, "omp.sizes");
+  AllocaInst *MapT = B.CreateAlloca(I64Arr, nullptr, "omp.maptypes");
+  Constant *Zero64 = ConstantInt::get(I64, 0);
+  unsigned Index = 0;
+  for (Value *Arg : HostCall->args()) {
+    Value *BP = B.CreateInBoundsGEP(PtrArr, Base,
+                                    {B.getInt32(0), B.getInt32(Index)});
+    B.CreateStore(Arg, BP);
+    Value *SP = B.CreateInBoundsGEP(I64Arr, Sizes,
+                                    {B.getInt32(0), B.getInt32(Index)});
+    B.CreateStore(Zero64, SP);
+    Value *MP = B.CreateInBoundsGEP(I64Arr, MapT,
+                                    {B.getInt32(0), B.getInt32(Index)});
+    B.CreateStore(Zero64, MP);
+    ++Index;
+  }
+
+  ArrayType *Arr3 = ArrayType::get(I32, 3);
+  StructType *ArgTy =
+      StructType::get(Ctx, {I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, I64, I64,
+                            Arr3, Arr3, I32});
+  AllocaInst *Args = B.CreateAlloca(ArgTy, nullptr, "omp.kernel.args");
+  auto field_ptr = [&](unsigned I) {
+    return B.CreateStructGEP(ArgTy, Args, I);
+  };
+  B.CreateStore(ConstantInt::get(I32, 3), field_ptr(0));
+  B.CreateStore(ConstantInt::get(I32, NArgs), field_ptr(1));
+  Value *BasePtr = B.CreateBitCast(Base, Ptr);
+  B.CreateStore(BasePtr, field_ptr(2));
+  B.CreateStore(BasePtr, field_ptr(3));
+  B.CreateStore(Sizes, field_ptr(4));
+  B.CreateStore(MapT, field_ptr(5));
+  Value *Null = ConstantPointerNull::get(cast<PointerType>(Ptr));
+  B.CreateStore(Null, field_ptr(6));
+  B.CreateStore(Null, field_ptr(7));
+  B.CreateStore(Zero64, field_ptr(8));
+  B.CreateStore(Zero64, field_ptr(9));
+  Constant *Neg1Arr = ConstantArray::get(
+      Arr3, {ConstantInt::get(I32, -1), ConstantInt::get(I32, 0),
+             ConstantInt::get(I32, 0)});
+  B.CreateStore(Neg1Arr, field_ptr(10));
+  B.CreateStore(ConstantAggregateZero::get(Arr3), field_ptr(11));
+  B.CreateStore(ConstantInt::get(I32, 0), field_ptr(12));
+
+  FunctionCallee TgtKernel = M->getOrInsertFunction(
+      "__tgt_target_kernel",
+      FunctionType::get(I32, {Ptr, I64, I32, I32, Ptr, Ptr}, false));
+  Value *Ret = B.CreateCall(
+      TgtKernel, {TgtIdent, ConstantInt::get(I64, -1),
+                  ConstantInt::get(I32, -1), ConstantInt::get(I32, 0),
+                  ConstantExpr::getBitCast(RegionId, Ptr), Args});
+  Value *Fallback = B.CreateICmpNE(Ret, ConstantInt::get(I32, 0));
+  BasicBlock *FB = BasicBlock::Create(Ctx, "omp.target.fallback", F);
+  B.CreateCondBr(Fallback, FB, Cont);
+  OldBr->eraseFromParent();
+
+  IRBuilder<> FBB(FB);
+  add_thread_push(FBB);
+  FBB.CreateCall(Fork, ForkArgs);
+  FBB.CreateBr(Cont);
+
   HostCall->eraseFromParent();
 
   return 1;
