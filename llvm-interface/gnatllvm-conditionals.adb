@@ -1611,12 +1611,15 @@ package body GNATLLVM.Conditionals is
       end if;
 
       --  A pending parallel-for pragma turns the loop into a libomp microtask.
-      --  Target regions still execute sequentially here (native target
-      --  offload for GNAT-LLVM remains future work).
+      --  A target region is lowered the same way for now: the host team
+      --  executes the region (host device fallback).  Emitting a device image
+      --  and dispatching through libomptarget's __tgt_target_kernel is the
+      --  next step (see docs/GNAT_LLVM_OPENMP.md).
 
       if Is_For_Loop and then OpenMP_Requested
         and then (OpenMP_Dir = OpenMP_Parallel_For
-                  or else OpenMP_Dir = OpenMP_Parallel_For_Simd)
+                  or else OpenMP_Dir = OpenMP_Parallel_For_Simd
+                  or else OpenMP_Dir = OpenMP_Target)
       then
          declare
             Ignored : unsigned;
