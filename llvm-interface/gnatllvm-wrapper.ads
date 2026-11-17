@@ -84,6 +84,14 @@ package GNATLLVM.Wrapper is
    --  Attach self-referential `llvm.loop` metadata (vectorize/unroll) to the
    --  latch terminator Term.  Width of 0 or 1 means no explicit width.
 
+   function Outline_Parallel_For
+     (Header      : Basic_Block_T;
+      Num_Threads : unsigned;
+      Reversed    : unsigned) return unsigned
+     with Import, Convention => C, External_Name => "Outline_Parallel_For";
+   --  Outline the loop headed by Header into a libomp microtask and replace it
+   --  with __kmpc_fork_call.  Returns 1 on success.
+
    procedure Add_Asm_Element_Type
      (Call : Value_T; Index : unsigned; Element_Type : Type_T)
      with Import, Convention => C, External_Name => "Add_Asm_Element_Type";

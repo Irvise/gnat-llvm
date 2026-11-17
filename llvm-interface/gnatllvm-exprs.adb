@@ -1188,6 +1188,8 @@ package body GNATLLVM.Exprs is
       Arg : Node_Id := First (Pragma_Argument_Associations (N));
    begin
       OpenMP_Pending := False;
+      OpenMP_Directive := OpenMP_None;
+      OpenMP_Num_Threads := 0;
       OpenMP_Simdlen := 0;
       OpenMP_Safelen := 0;
 
@@ -1202,14 +1204,20 @@ package body GNATLLVM.Exprs is
             Dir : String := Get_Name_String (Chars (Expression (Arg)));
          begin
             System.Case_Util.To_Lower (Dir);
-            OpenMP_Pending :=
-              Dir = "simd" or else Dir = "for_simd"
-              or else Dir = "parallel_for_simd"
-              or else Dir = "parallel_for" or else Dir = "target";
+            if Dir = "simd" or else Dir = "for_simd" then
+               OpenMP_Directive := OpenMP_Simd;
+            elsif Dir = "parallel_for_simd" then
+               OpenMP_Directive := OpenMP_Parallel_For_Simd;
+            elsif Dir = "parallel_for" then
+               OpenMP_Directive := OpenMP_Parallel_For;
+            elsif Dir = "target" then
+               OpenMP_Directive := OpenMP_Target;
+            end if;
+            OpenMP_Pending := OpenMP_Directive /= OpenMP_None;
          end;
       end if;
 
-      --  Scan named Simdlen/Safelen associations.
+      --  Scan named Simdlen/Safelen/Num_Threads associations.
 
       while Present (Arg) loop
          if Present (Chars (Arg)) and then Present (Expression (Arg)) then
@@ -1222,6 +1230,9 @@ package body GNATLLVM.Exprs is
                     Nat (UI_To_Int (Expr_Value (Expression (Arg))));
                elsif CName = "safelen" then
                   OpenMP_Safelen :=
+                    Nat (UI_To_Int (Expr_Value (Expression (Arg))));
+               elsif CName = "num_threads" then
+                  OpenMP_Num_Threads :=
                     Nat (UI_To_Int (Expr_Value (Expression (Arg))));
                end if;
             end;

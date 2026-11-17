@@ -11,6 +11,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Attributes.h"
@@ -24,6 +25,8 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/MDBuilder.h"
@@ -55,6 +58,7 @@
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Scalar/LoopRotation.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/CodeExtractor.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticIDs.h"
@@ -2156,4 +2160,310 @@ extern "C" void Set_Loop_Metadata_For_Vectorize(LLVMValueRef Term_Ref,
   MDNode *Loop_ID = MDNode::getDistinct(Ctx, Loop_Ops);
   Loop_ID->replaceOperandWith(0, Loop_ID);
   Term->setMetadata(LLVMContext::MD_loop, Loop_ID);
+}
+
+// ---------------------------------------------------------------------------
+// Native OpenMP parallel-for outlining
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Create (once per module) a helper returning the per-thread numeric lower
+// (High = false) or upper (High = true) bound of [Lo, Hi] for a static split
+// across the current OpenMP team.  Implemented in IR so that no extra runtime
+// object has to be linked beyond libomp itself.
+Function *Get_Or_Create_Range_Fn(Module *M, bool High) {
+  const char *Name =
+      High ? "gnat.omp.thread_high" : "gnat.omp.thread_low";
+  if (Function *Existing = M->getFunction(Name))
+    return Existing;
+
+  LLVMContext &Ctx = M->getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  FunctionType *FT = FunctionType::get(I64, {I64, I64}, false);
+  Function *F = Function::Create(FT, GlobalValue::InternalLinkage, Name, M);
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+
+  Value *Lo = F->getArg(0);
+  Value *Hi = F->getArg(1);
+  FunctionCallee TidF =
+      M->getOrInsertFunction("omp_get_thread_num", Type::getInt32Ty(Ctx));
+  FunctionCallee NumF =
+      M->getOrInsertFunction("omp_get_num_threads", Type::getInt32Ty(Ctx));
+  Value *Tid = B.CreateSExt(B.CreateCall(TidF), I64);
+  Value *Num = B.CreateSExt(B.CreateCall(NumF), I64);
+
+  // total = Hi - Lo + 1, clamped to >= 0
+  Value *Total = B.CreateAdd(B.CreateSub(Hi, Lo), B.getInt64(1));
+  Value *NonEmpty = B.CreateICmpSGT(Total, B.getInt64(0));
+  Value *T = B.CreateSelect(NonEmpty, Total, B.getInt64(0));
+  // A team has at least one thread.
+  Value *NumPos = B.CreateICmpSGT(Num, B.getInt64(0));
+  Value *N = B.CreateSelect(NumPos, Num, B.getInt64(1));
+  // Clamp tid into [0, N-1].
+  Value *TidInTeam =
+      B.CreateSelect(B.CreateICmpSLT(Tid, N), Tid, B.CreateSub(N, B.getInt64(1)));
+
+  Value *Base = B.CreateSDiv(T, N);
+  Value *Rem = B.CreateSRem(T, N);
+  Value *Extra =
+      B.CreateSelect(B.CreateICmpSLT(TidInTeam, Rem), B.getInt64(1),
+                     B.getInt64(0));
+  Value *Offset =
+      B.CreateAdd(B.CreateMul(TidInTeam, Base),
+                  B.CreateSelect(B.CreateICmpSLT(TidInTeam, Rem), TidInTeam, Rem));
+  Value *LowP = B.CreateAdd(Lo, Offset);
+
+  if (!High)
+    return B.CreateRet(LowP), F;
+
+  Value *Count = B.CreateAdd(Base, Extra);
+  return B.CreateRet(B.CreateSub(B.CreateAdd(LowP, Count), B.getInt64(1))), F;
+}
+
+// Emit a call to the range helper at At, returning a value of type Ty.
+Value *Range_Call(Module *M, bool High, Value *Lo, Value *Hi, Type *Ty,
+                  Instruction *At) {
+  Function *F = Get_Or_Create_Range_Fn(M, High);
+  IRBuilder<> B(At);
+  Type *I64 = B.getInt64Ty();
+  Value *L = B.CreateSExtOrTrunc(Lo, I64);
+  Value *H = B.CreateSExtOrTrunc(Hi, I64);
+  Value *C = B.CreateCall(F, {L, H});
+  return B.CreateSExtOrTrunc(C, Ty);
+}
+
+Constant *Get_OpenMP_Ident(Module *M) {
+  if (GlobalVariable *G = M->getNamedGlobal("gnat.omp.ident"))
+    return G;
+
+  LLVMContext &Ctx = M->getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  StructType *IdentTy = StructType::get(I32, I32, I32, I32, Ptr);
+
+  Constant *Src =
+      ConstantDataArray::getString(Ctx, "gnat-openmp", /*AddNull=*/true);
+  auto *SrcGV = new GlobalVariable(*M, Src->getType(), true,
+                                   GlobalValue::InternalLinkage, Src,
+                                   "gnat.omp.source");
+  Constant *SrcPtr = ConstantExpr::getBitCast(SrcGV, Ptr);
+  Constant *Zero = ConstantInt::get(I32, 0);
+  Constant *Init =
+      ConstantStruct::get(IdentTy, {Zero, Zero, Zero, Zero, SrcPtr});
+  auto *GV = new GlobalVariable(*M, IdentTy, true, GlobalValue::InternalLinkage,
+                                Init, "gnat.omp.ident");
+  return GV;
+}
+
+// Find the block of F that is terminated by a void return.
+BasicBlock *Find_Return_Block(Function *F) {
+  BasicBlock *Result = nullptr;
+  for (BasicBlock &BB : *F) {
+    if (isa<ReturnInst>(BB.getTerminator()) && BB.getTerminator()->getNumSuccessors() == 0) {
+      if (Result)
+        return nullptr;
+      Result = &BB;
+    }
+  }
+  return Result;
+}
+
+} // namespace
+
+// Outline the loop headed by Header into a libomp microtask and replace the
+// loop with a call to __kmpc_fork_call.  Returns 1 on success; on failure the
+// loop keeps its sequential form (or remains a plain call if extraction
+// already happened, which is still correct).
+extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
+                                    unsigned Num_Threads,
+                                    unsigned Reversed) {
+  auto *Header = dyn_cast<BasicBlock>(unwrap(Header_Ref));
+  if (!Header)
+    return 0;
+  Function *F = Header->getParent();
+  Module *M = F->getParent();
+
+  DominatorTree DT(*F);
+  LoopInfo LI(DT);
+  Loop *L = LI.getLoopFor(Header);
+  if (!L || L->getHeader() != Header)
+    return 0;
+  BasicBlock *Pre = L->getLoopPreheader();
+  if (!Pre)
+    return 0;
+
+  // CodeExtractor cannot outline the function entry block.  When the
+  // parallel loop is the first statement, its preheader *is* the entry block,
+  // so split it at the loop-variable initialization and outline the tail.
+  if (Pre == &F->getEntryBlock()) {
+    Instruction *SplitAt = nullptr;
+    for (Instruction &I : *Pre)
+      if (isa<StoreInst>(&I))
+        SplitAt = &I;
+    if (!SplitAt)
+      return 0;
+    Pre->splitBasicBlock(SplitAt, "omp.preheader");
+    DT.recalculate(*F);
+    LI.analyze(DT);
+    L = LI.getLoopFor(Header);
+    if (!L || L->getHeader() != Header)
+      return 0;
+    Pre = L->getLoopPreheader();
+    if (!Pre)
+      return 0;
+  }
+
+  SmallVector<BasicBlock *, 32> Blocks;
+  Blocks.push_back(Pre);
+  for (BasicBlock *BB : L->blocks())
+    Blocks.push_back(BB);
+
+  CodeExtractor CE(Blocks, &DT);
+  if (!CE.isEligible())
+    return 0;
+
+  // Bail out before extracting if the region writes values used after it;
+  // forwarding those through a parallel region would be incorrect.
+  SetVector<Value *> Inputs, Outputs, Allocas;
+  CE.findInputsOutputs(Inputs, Outputs, Allocas);
+  if (!Outputs.empty())
+    return 0;
+
+  CodeExtractorAnalysisCache CEAC(*F);
+  Function *E = CE.extractCodeRegion(CEAC, Inputs, Outputs);
+  if (!E || !Outputs.empty())
+    return 0;
+
+  // Locate the call to the outlined function in the caller.
+  CallInst *HostCall = nullptr;
+  for (BasicBlock &BB : *F)
+    for (Instruction &I : BB)
+      if (auto *C = dyn_cast<CallInst>(&I))
+        if (C->getCalledFunction() == E)
+          HostCall = C;
+  if (!HostCall)
+    return 0;
+
+  // Inspect the outlined loop.
+  DominatorTree DT2(*E);
+  LoopInfo LI2(DT2);
+  if (LI2.empty())
+    return 0;
+  Loop *OL = *LI2.begin();
+  BasicBlock *OPre = OL->getLoopPreheader();
+  BasicBlock *OLatch = OL->getLoopLatch();
+  if (!OPre || !OLatch)
+    return 0;
+  auto *LatchBr = dyn_cast<BranchInst>(OLatch->getTerminator());
+  if (!LatchBr || !LatchBr->isConditional())
+    return 0;
+  auto *Cmp = dyn_cast<ICmpInst>(LatchBr->getCondition());
+  if (!Cmp)
+    return 0;
+
+  // The loop start is the value stored by the last store in the preheader;
+  // the loop end is the non-induction operand of the latch comparison.
+  StoreInst *InitStore = nullptr;
+  for (Instruction &I : *OPre)
+    if (auto *SI = dyn_cast<StoreInst>(&I))
+      InitStore = SI;
+  if (!InitStore)
+    return 0;
+  Value *Start = InitStore->getValueOperand();
+  Value *Last = Cmp->getOperand(1);
+  if (Start->getType() != Last->getType())
+    return 0;
+
+  Instruction *Term = OPre->getTerminator();
+
+  // If the loop variable lives in the caller's frame it arrives as a pointer
+  // input and every thread would race on it.  Give each invocation a private
+  // induction variable instead.
+  if (auto *Arg = dyn_cast<Argument>(InitStore->getPointerOperand()))
+    if (Arg->getParent() == E) {
+      IRBuilder<> AB(&*E->getEntryBlock().getFirstInsertionPt());
+      AllocaInst *Private =
+          AB.CreateAlloca(Start->getType(), nullptr, "omp.private.iv");
+      Arg->replaceAllUsesWith(Private);
+    }
+
+  // Compute this thread's subrange before the loop-variable initialization,
+  // which itself uses the lower bound.
+  Value *NumericLo = Reversed ? Last : Start;
+  Value *NumericHi = Reversed ? Start : Last;
+  Type *Ty = Start->getType();
+  Value *ThreadLo = Range_Call(M, false, NumericLo, NumericHi, Ty, InitStore);
+  Value *ThreadHi = Range_Call(M, true, NumericLo, NumericHi, Ty, InitStore);
+
+  Value *InitVal = Reversed ? ThreadHi : ThreadLo;
+  Value *LastVal = Reversed ? ThreadLo : ThreadHi;
+
+  // Skip the loop for threads whose subrange is empty.  The loop is a
+  // do-while, so this guard is required, not just an optimization.
+  BasicBlock *RetBB = Find_Return_Block(E);
+  auto *TermBr = dyn_cast<BranchInst>(Term);
+  if (RetBB && TermBr && TermBr->isUnconditional()
+      && TermBr->getSuccessor(0) == OL->getHeader()) {
+    IRBuilder<> GB(Term);
+    Value *NonEmpty = GB.CreateICmpSLE(ThreadLo, ThreadHi);
+    GB.CreateCondBr(NonEmpty, OL->getHeader(), RetBB);
+    Term->eraseFromParent();
+  } else {
+    // No usable guard: clamp the start so an empty thread runs at most one
+    // (idempotent) iteration instead of looping forever.
+    IRBuilder<> CB(Term);
+    InitVal = CB.CreateSelect(CB.CreateICmpSLE(ThreadLo, ThreadHi),
+                              InitVal, LastVal);
+  }
+
+  // Rebind the loop to this thread's subrange.
+  InitStore->setOperand(0, InitVal);
+  Cmp->setOperand(1, LastVal);
+
+  // Build the microtask wrapper: (global_tid, bound_tid, inputs...).
+  LLVMContext &Ctx = M->getContext();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  Type *Void = Type::getVoidTy(Ctx);
+
+  SmallVector<Type *, 8> WParams = {Ptr, Ptr};
+  for (Value *Arg : HostCall->args())
+    WParams.push_back(Arg->getType());
+  FunctionType *WFT = FunctionType::get(Void, WParams, false);
+  Function *W = Function::Create(WFT, GlobalValue::InternalLinkage,
+                                 F->getName() + ".omp_outlined", M);
+  BasicBlock *WEntry = BasicBlock::Create(Ctx, "entry", W);
+  IRBuilder<> WB(WEntry);
+  SmallVector<Value *, 8> Fwd;
+  for (unsigned I = 0; I < HostCall->arg_size(); ++I)
+    Fwd.push_back(W->getArg(I + 2));
+  WB.CreateCall(E, Fwd);
+  WB.CreateRetVoid();
+
+  // __kmpc_fork_call(&ident, argc, wrapper, args...)
+  FunctionCallee Fork = M->getOrInsertFunction(
+      "__kmpc_fork_call", FunctionType::get(Void, {Ptr, I32, Ptr}, true));
+  Constant *Ident = Get_OpenMP_Ident(M);
+
+  IRBuilder<> HB(HostCall);
+  if (Num_Threads > 0) {
+    FunctionCallee GTid = M->getOrInsertFunction(
+        "__kmpc_global_thread_num", FunctionType::get(I32, {Ptr}, false));
+    Value *Tid = HB.CreateCall(GTid, {Ident});
+    FunctionCallee Push = M->getOrInsertFunction(
+        "__kmpc_push_num_threads",
+        FunctionType::get(Void, {Ptr, I32, I32}, false));
+    HB.CreateCall(Push, {Ident, Tid, ConstantInt::get(I32, Num_Threads)});
+  }
+
+  SmallVector<Value *, 8> ForkArgs = {
+      Ident, ConstantInt::get(I32, HostCall->arg_size()), W};
+  for (Value *Arg : HostCall->args())
+    ForkArgs.push_back(Arg);
+  HB.CreateCall(Fork, ForkArgs);
+  HostCall->eraseFromParent();
+
+  return 1;
 }

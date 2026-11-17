@@ -1412,22 +1412,32 @@ package body GNATLLVM.Conditionals is
       procedure Emit_Loop_Body;
       --  Emit the body of the loop
 
-      --  Consume any pending pragma OpenMP (Simd) request now, so that loops
-      --  nested inside this loop's body do not swallow it.
+      --  Consume any pending pragma OpenMP request now, so that loops nested
+      --  inside this loop's body do not swallow it.
 
-      Simd_Requested : constant Boolean  := OpenMP_Pending;
-      Simd_Width     : constant unsigned := unsigned (OpenMP_Simdlen);
+      OpenMP_Requested : constant Boolean := OpenMP_Pending;
+      OpenMP_Dir       : constant OpenMP_Directive_Kind := OpenMP_Directive;
+      OpenMP_Threads   : constant Nat := OpenMP_Num_Threads;
+      Simd_Width       : constant unsigned := unsigned (OpenMP_Simdlen);
+
+      Parallel_Reversed : Boolean := False;
 
       procedure Emit_OpenMP_Loop_Metadata (Term : Value_T);
       --  Attach the pending SIMD metadata to the latch terminator Term.
 
       procedure Emit_OpenMP_Loop_Metadata (Term : Value_T) is
+         Simd : constant Boolean :=
+           OpenMP_Requested
+           and then (OpenMP_Dir = OpenMP_Simd
+                     or else OpenMP_Dir = OpenMP_Parallel_For_Simd);
       begin
-         if Simd_Requested and then Present (Term) then
+         if Simd and then Present (Term) then
             Set_Loop_Metadata_For_Vectorize (Term, 1, Simd_Width, 0);
          end if;
 
          OpenMP_Pending := False;
+         OpenMP_Directive := OpenMP_None;
+         OpenMP_Num_Threads := 0;
          OpenMP_Simdlen := 0;
          OpenMP_Safelen := 0;
       end Emit_OpenMP_Loop_Metadata;
@@ -1569,6 +1579,7 @@ package body GNATLLVM.Conditionals is
 
             --  Initialization block: initialize the loop variable
 
+            Parallel_Reversed := Reversed;
             Set_Value                        (E, Loop_Var);
             Create_Local_Variable_Debug_Data (E, Loop_Var);
             C_Set_Entity                     (Loop_Var, E);
@@ -1598,6 +1609,30 @@ package body GNATLLVM.Conditionals is
             end if;
          end;
       end if;
+
+      --  A pending parallel-for pragma turns the loop into a libomp microtask.
+      --  Target regions still execute sequentially here (native target
+      --  offload for GNAT-LLVM remains future work).
+
+      if Is_For_Loop and then OpenMP_Requested
+        and then (OpenMP_Dir = OpenMP_Parallel_For
+                  or else OpenMP_Dir = OpenMP_Parallel_For_Simd)
+      then
+         declare
+            Ignored : unsigned;
+            pragma Unreferenced (Ignored);
+         begin
+            Ignored := Outline_Parallel_For
+              (BB_Start, unsigned (OpenMP_Threads),
+               (if Parallel_Reversed then 1 else 0));
+         end;
+      end if;
+
+      OpenMP_Pending := False;
+      OpenMP_Directive := OpenMP_None;
+      OpenMP_Num_Threads := 0;
+      OpenMP_Simdlen := 0;
+      OpenMP_Safelen := 0;
 
       Position_Builder_At_End (BB_Exit);
 
