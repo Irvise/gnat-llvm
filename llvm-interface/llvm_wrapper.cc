@@ -2115,3 +2115,45 @@ Create_Expression_With_Variables(LLVMDIBuilderRef Builder, uint64_t *Expr,
   assert(0);
 #endif
 }
+
+// Attach self-referential `llvm.loop` metadata to a loop latch terminator so
+// the vectorizer / unroller act on the loop.  This mirrors what Clang emits for
+// `#pragma omp simd` and is the first native OpenMP lowering hook used by
+// GNAT-LLVM (`pragma OpenMP (Simd, ...)`).
+extern "C" void Set_Loop_Metadata_For_Vectorize(LLVMValueRef Term_Ref,
+                                                unsigned Enable,
+                                                unsigned Width,
+                                                unsigned Unroll) {
+  auto *Term = dyn_cast<Instruction>(unwrap(Term_Ref));
+  if (!Term)
+    return;
+
+  LLVMContext &Ctx = Term->getContext();
+  SmallVector<Metadata *, 4> Loop_Ops;
+  // The first operand must be a self-reference; fill it in after creating a
+  // distinct node (a uniqued node cannot be made self-referential).
+  Loop_Ops.push_back(nullptr);
+
+  auto Add_Bool = [&](const char *Name) {
+    Loop_Ops.push_back(MDNode::get(
+        Ctx, {MDString::get(Ctx, Name),
+              ConstantAsMetadata::get(
+                  ConstantInt::get(Type::getInt1Ty(Ctx), 1))}));
+  };
+
+  if (Enable)
+    Add_Bool("llvm.loop.vectorize.enable");
+  if (Unroll)
+    Add_Bool("llvm.loop.unroll.enable");
+
+  if (Width > 1) {
+    Loop_Ops.push_back(MDNode::get(
+        Ctx, {MDString::get(Ctx, "llvm.loop.vectorize.width"),
+              ConstantAsMetadata::get(
+                  ConstantInt::get(Type::getInt32Ty(Ctx), Width))}));
+  }
+
+  MDNode *Loop_ID = MDNode::getDistinct(Ctx, Loop_Ops);
+  Loop_ID->replaceOperandWith(0, Loop_ID);
+  Term->setMetadata(LLVMContext::MD_loop, Loop_ID);
+}

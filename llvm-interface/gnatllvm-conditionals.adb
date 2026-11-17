@@ -28,6 +28,7 @@ with GNATLLVM.Instructions; use GNATLLVM.Instructions;
 with GNATLLVM.MDType;       use GNATLLVM.MDType;
 with GNATLLVM.Subprograms;  use GNATLLVM.Subprograms;
 with GNATLLVM.Utils;        use GNATLLVM.Utils;
+with GNATLLVM.Wrapper;      use GNATLLVM.Wrapper;
 
 package body GNATLLVM.Conditionals is
 
@@ -1411,6 +1412,26 @@ package body GNATLLVM.Conditionals is
       procedure Emit_Loop_Body;
       --  Emit the body of the loop
 
+      --  Consume any pending pragma OpenMP (Simd) request now, so that loops
+      --  nested inside this loop's body do not swallow it.
+
+      Simd_Requested : constant Boolean  := OpenMP_Pending;
+      Simd_Width     : constant unsigned := unsigned (OpenMP_Simdlen);
+
+      procedure Emit_OpenMP_Loop_Metadata (Term : Value_T);
+      --  Attach the pending SIMD metadata to the latch terminator Term.
+
+      procedure Emit_OpenMP_Loop_Metadata (Term : Value_T) is
+      begin
+         if Simd_Requested and then Present (Term) then
+            Set_Loop_Metadata_For_Vectorize (Term, 1, Simd_Width, 0);
+         end if;
+
+         OpenMP_Pending := False;
+         OpenMP_Simdlen := 0;
+         OpenMP_Safelen := 0;
+      end Emit_OpenMP_Loop_Metadata;
+
       Loop_Identifier : constant Opt_E_Loop_Id             :=
         (if Present (Identifier (N)) then Entity (Identifier (N)) else Empty);
       Iter_Scheme     : constant Opt_N_Iteration_Scheme_Id :=
@@ -1565,7 +1586,15 @@ package body GNATLLVM.Conditionals is
                Prev := Get (Loop_Var, Data);
                Store ((if Reversed then Sub (Prev, One) else Add (Prev, One)),
                       Loop_Var);
-               Build_Cond_Br (I_Cmp (Int_NE, Prev, Last), BB_Start, BB_Exit);
+               declare
+                  Latch : constant Basic_Block_T :=
+                    Get_Insert_Block (IR_Builder);
+               begin
+                  Build_Cond_Br
+                    (I_Cmp (Int_NE, Prev, Last), BB_Start, BB_Exit);
+                  Emit_OpenMP_Loop_Metadata
+                    (Get_Basic_Block_Terminator (Latch));
+               end;
             end if;
          end;
       end if;

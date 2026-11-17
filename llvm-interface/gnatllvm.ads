@@ -270,6 +270,14 @@ package GNATLLVM is
    IR_Builder         : Builder_T;
    --  The current LLVM Instruction builder
 
+   --  Pending native OpenMP request.  The Ada front end accepts
+   --  `pragma OpenMP (Simd, ...)` as an unrecognized pragma, and ccg records
+   --  it here so the next loop statement can be lowered (currently into
+   --  LLVM loop metadata; parallel/target lowering is future work).
+   OpenMP_Pending      : Boolean := False;
+   OpenMP_Simdlen      : Nat     := 0;
+   OpenMP_Safelen      : Nat     := 0;
+
    DI_Builder          : DI_Builder_T;
    --  The current LLVM Debug Info builder
 

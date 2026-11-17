@@ -23,9 +23,11 @@ with Exp_Util;    use Exp_Util;
 with Nlists;      use Nlists;
 with Opt;         use Opt;
 with Sem_Aggr;    use Sem_Aggr;
+with Sem_Eval;    use Sem_Eval;
 with Sem_Util;    use Sem_Util;
 with Snames;      use Snames;
 with Stringt;     use Stringt;
+with System.Case_Util;
 with Table;       use Table;
 with Uintp.LLVM;  use Uintp.LLVM;
 with Urealp;      use Urealp;
@@ -1161,6 +1163,73 @@ package body GNATLLVM.Exprs is
       Perform_Writebacks;
    end Emit_Assignment_Statement;
 
+   function Is_OpenMP_Pragma (N : N_Pragma_Id) return Boolean;
+   --  Say whether N is a (front-end-unrecognized) pragma OpenMP/OMP
+
+   procedure Record_OpenMP_Pragma (N : N_Pragma_Id);
+   --  Record the directive/clauses of pragma OpenMP for the next loop
+
+   -----------------------
+   -- Is_OpenMP_Pragma  --
+   -----------------------
+
+   function Is_OpenMP_Pragma (N : N_Pragma_Id) return Boolean is
+      Name : String := Get_Name_String (Chars (Pragma_Identifier (N)));
+   begin
+      System.Case_Util.To_Lower (Name);
+      return Name = "openmp" or else Name = "omp";
+   end Is_OpenMP_Pragma;
+
+   --------------------------
+   -- Record_OpenMP_Pragma --
+   --------------------------
+
+   procedure Record_OpenMP_Pragma (N : N_Pragma_Id) is
+      Arg : Node_Id := First (Pragma_Argument_Associations (N));
+   begin
+      OpenMP_Pending := False;
+      OpenMP_Simdlen := 0;
+      OpenMP_Safelen := 0;
+
+      --  The first positional argument names the directive.
+
+      if Present (Arg)
+        and then Chars (Arg) = No_Name
+        and then Present (Expression (Arg))
+        and then Nkind (Expression (Arg)) = N_Identifier
+      then
+         declare
+            Dir : String := Get_Name_String (Chars (Expression (Arg)));
+         begin
+            System.Case_Util.To_Lower (Dir);
+            OpenMP_Pending :=
+              Dir = "simd" or else Dir = "for_simd"
+              or else Dir = "parallel_for_simd"
+              or else Dir = "parallel_for" or else Dir = "target";
+         end;
+      end if;
+
+      --  Scan named Simdlen/Safelen associations.
+
+      while Present (Arg) loop
+         if Present (Chars (Arg)) and then Present (Expression (Arg)) then
+            declare
+               CName : String := Get_Name_String (Chars (Arg));
+            begin
+               System.Case_Util.To_Lower (CName);
+               if CName = "simdlen" then
+                  OpenMP_Simdlen :=
+                    Nat (UI_To_Int (Expr_Value (Expression (Arg))));
+               elsif CName = "safelen" then
+                  OpenMP_Safelen :=
+                    Nat (UI_To_Int (Expr_Value (Expression (Arg))));
+               end if;
+            end;
+         end if;
+         Arg := Next (Arg);
+      end loop;
+   end Record_OpenMP_Pragma;
+
    -----------------
    -- Emit_Pragma --
    -----------------
@@ -1271,6 +1340,16 @@ package body GNATLLVM.Exprs is
               and then Nkind (Expression (First (PAAs))) = N_String_Literal
             then
                Emit_Annotation (N);
+            end if;
+
+         --  pragma OpenMP is not a registered Ada pragma, so it lands here.
+         --  Record a pending request that the next loop consumes.  `Simd`
+         --  (and `For_Simd`) lower to LLVM loop metadata; parallel/target
+         --  forms are recorded but still execute sequentially for now.
+
+         when Pragma_Unknown =>
+            if Is_OpenMP_Pragma (N) then
+               Record_OpenMP_Pragma (N);
             end if;
 
          when others => null;

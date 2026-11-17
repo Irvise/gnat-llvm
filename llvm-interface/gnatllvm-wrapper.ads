@@ -74,6 +74,16 @@ package GNATLLVM.Wrapper is
    procedure Add_Cold_Attribute (Func : Value_T)
      with Import, Convention => C, External_Name => "Add_Cold_Attribute";
 
+   procedure Set_Loop_Metadata_For_Vectorize
+     (Term   : Value_T;
+      Enable : unsigned;
+      Width  : unsigned;
+      Unroll : unsigned)
+     with Import, Convention => C,
+          External_Name => "Set_Loop_Metadata_For_Vectorize";
+   --  Attach self-referential `llvm.loop` metadata (vectorize/unroll) to the
+   --  latch terminator Term.  Width of 0 or 1 means no explicit width.
+
    procedure Add_Asm_Element_Type
      (Call : Value_T; Index : unsigned; Element_Type : Type_T)
      with Import, Convention => C, External_Name => "Add_Asm_Element_Type";
