@@ -287,6 +287,8 @@ package GNATLLVM is
    --  keep such loops sequential instead of producing a wrong checksum.
    OpenMP_Has_Reduction : Boolean := False;
    OpenMP_In_Target_Body : Boolean := False;
+   OpenMP_Target_Data_Pending : Boolean := False;
+   OpenMP_Target_Data_Expr : Node_Id := Empty;
 
    DI_Builder          : DI_Builder_T;
    --  The current LLVM Debug Info builder

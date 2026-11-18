@@ -1213,6 +1213,26 @@ package body GNATLLVM.Exprs is
                OpenMP_Directive := OpenMP_Parallel_For;
             elsif Dir = "target" then
                OpenMP_Directive := OpenMP_Target;
+            elsif Dir = "target_data" or else Dir = "targetdata" then
+               OpenMP_Target_Data_Pending := True;
+               declare
+                  A : Node_Id := First (Pragma_Argument_Associations (N));
+               begin
+                  while Present (A) loop
+                     if Present (Chars (A)) then
+                        declare
+                           CN : String := Get_Name_String (Chars (A));
+                        begin
+                           System.Case_Util.To_Lower (CN);
+                           if CN = "tofrom" then
+                              OpenMP_Target_Data_Expr := Expression (A);
+                           end if;
+                        end;
+                     end if;
+                     A := Next (A);
+                  end loop;
+               end;
+               Mark_OpenMP_Target_Data (+Current_Func);
             end if;
             OpenMP_Pending := OpenMP_Directive /= OpenMP_None;
          end;

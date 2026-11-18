@@ -2411,6 +2411,56 @@ struct OMPRegion {
 };
 static SmallVector<OMPRegion, 4> Pending_OMP_Regions;
 
+static SmallPtrSet<Function *, 4> Target_Data_Functions;
+extern "C" void Mark_OpenMP_Target_Data(LLVMValueRef FuncRef) {
+  if (Function *F = dyn_cast_or_null<Function>(unwrap(FuncRef)))
+    Target_Data_Functions.insert(F);
+}
+struct OMPDataMapping {
+  Function *Func;
+  GlobalVariable *Base, *Sizes, *MapTypes, *Active;
+  unsigned NArgs;
+};
+static SmallVector<OMPDataMapping, 8> Pending_Data_Ends;
+
+extern "C" void Emit_OpenMP_Target_Data_End(LLVMValueRef BBRef) {
+  BasicBlock *BB = dyn_cast_or_null<BasicBlock>(unwrap(BBRef));
+  if (!BB) return;
+  Function *F = BB->getParent();
+  Module *M = F->getParent();
+  LLVMContext &Ctx = F->getContext();
+  Type *Ptr = PointerType::getUnqual(Ctx), *I64 = Type::getInt64Ty(Ctx),
+       *I32 = Type::getInt32Ty(Ctx);
+  FunctionCallee DataEnd = M->getOrInsertFunction(
+      "__tgt_target_data_end",
+      FunctionType::get(Type::getVoidTy(Ctx), {I64, I32, Ptr, Ptr, Ptr, Ptr}, false));
+  FunctionType *CT = FunctionType::get(Type::getVoidTy(Ctx), {}, false);
+  Function *Cleanup = Function::Create(CT, GlobalValue::InternalLinkage,
+      F->getName() + ".omp.data.cleanup", M);
+  IRBuilder<> CB(BasicBlock::Create(Ctx, "entry", Cleanup));
+  for (const OMPDataMapping &Mp : Pending_Data_Ends) {
+    if (Mp.Func != F) continue;
+    BasicBlock *EB = BasicBlock::Create(Ctx, "omp.data.end", Cleanup);
+    BasicBlock *NB = BasicBlock::Create(Ctx, "omp.data.next", Cleanup);
+    CB.CreateCondBr(CB.CreateICmpNE(CB.CreateLoad(Mp.Active->getValueType(), Mp.Active),
+                                    CB.getInt8(0)), EB, NB);
+    IRBuilder<> E(EB);
+    E.CreateCall(DataEnd, {ConstantInt::get(I64, -1), ConstantInt::get(I32, Mp.NArgs),
+                   E.CreateBitCast(Mp.Base, Ptr), E.CreateBitCast(Mp.Base, Ptr),
+                   E.CreateBitCast(Mp.Sizes, Ptr), E.CreateBitCast(Mp.MapTypes, Ptr)});
+    E.CreateBr(NB);
+    CB.SetInsertPoint(NB);
+  }
+  CB.CreateRetVoid();
+  IRBuilder<> B(BB);
+  if (Instruction *T = BB->getTerminator()) B.SetInsertPoint(T);
+  B.CreateCall(Cleanup);
+  Pending_Data_Ends.erase(
+      std::remove_if(Pending_Data_Ends.begin(), Pending_Data_Ends.end(),
+                     [F](const OMPDataMapping &Mp) { return Mp.Func == F; }),
+      Pending_Data_Ends.end());
+}
+
 extern "C" void Register_OpenMP_Target(Module *M, Function *E,
                                        GlobalVariable *RegionId,
                                        const char *KernelName,
@@ -2812,10 +2862,11 @@ extern "C" void Finalize_OpenMP_Images(Module *M) {
   if (!HaveHost && !HaveNVPTX)
     return;
   auto EntriesB = offloading::getOffloadEntryArray(*M, "omp_offloading_entries");
-  offloading::emitOffloadingEntry(*M, object::OFK_OpenMP,
-                                  ConstantPointerNull::get(cast<PointerType>(Ptr)),
-                                  "", 0, 0x10, 0x008, nullptr,
-                                  "omp_offloading_entries");
+  if (Target_Data_Functions.empty())
+    offloading::emitOffloadingEntry(
+        *M, object::OFK_OpenMP,
+        ConstantPointerNull::get(cast<PointerType>(Ptr)), "", 0, 0x10, 0x008,
+        nullptr, "omp_offloading_entries");
   for (const OMPRegion &R : Regions)
     offloading::emitOffloadingEntry(*M, object::OFK_OpenMP, R.RegionId,
                                     R.KernelName, 0, 0, 0, nullptr,
@@ -3147,6 +3198,7 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
   BasicBlock *Orig = HostCall->getParent();
   BasicBlock *Cont = Orig->splitBasicBlock(HostCall, "omp.target.cont");
   Instruction *OldBr = Orig->getTerminator();
+  bool ErasedOldBr = false;
 
   IRBuilder<> B(OldBr);
   unsigned ASize = NArgs ? NArgs : 1;
@@ -3155,11 +3207,14 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
   AllocaInst *Base = B.CreateAlloca(PtrArr, nullptr, "omp.base");
   AllocaInst *Sizes = B.CreateAlloca(I64Arr, nullptr, "omp.sizes");
   AllocaInst *MapT = B.CreateAlloca(I64Arr, nullptr, "omp.maptypes");
+  AllocaInst *MapTBegin = B.CreateAlloca(I64Arr, nullptr, "omp.maptypes.begin");
   Constant *Zero64 = ConstantInt::get(I64, 0);
   SmallVector<Value *, 8> MappedValues;
   SmallVector<Value *, 8> MappedSizes;
+  SmallVector<bool, 8> IsPtrArg;
   bool SizesKnown = true;
   for (Value *Arg : HostCall->args()) {
+    IsPtrArg.push_back(Arg->getType()->isPointerTy());
     Value *BaseVal = Arg;
     Value *Size;
     if (Arg->getType()->isPointerTy()) {
@@ -3187,7 +3242,72 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
     B.CreateStore(SizesKnown ? MappedSizes[Index] : Zero64, SP);
     Value *MP = B.CreateInBoundsGEP(I64Arr, MapT,
                                     {B.getInt32(0), B.getInt32(Index)});
-    B.CreateStore(ConstantInt::get(I64, SizesKnown ? 35 : 0), MP);
+    uint64_t MType = 0;
+    if (SizesKnown) {
+      bool IsArray = IsPtrArg[Index];
+      if (auto *CI = dyn_cast<ConstantInt>(MappedSizes[Index]))
+        IsArray &= CI->getZExtValue() > 8;
+      MType = Target_Data_Functions.count(F)
+                  ? (IsArray ? 0x1020 : 0x21)
+                  : 35;
+    }
+    B.CreateStore(ConstantInt::get(I64, MType), MP);
+    Value *MB = B.CreateInBoundsGEP(I64Arr, MapTBegin,
+                                    {B.getInt32(0), B.getInt32(Index)});
+    // Every mapped argument needs TO at data-begin so libomptarget actually
+    // copies its value to the device buffer.  With type 0 the buffer is
+    // allocated but left uninitialized; the kernel then reads garbage for
+    // by-value scalars such as loop bounds.
+    B.CreateStore(ConstantInt::get(I64, 3), MB);
+  }
+
+  if (Target_Data_Functions.count(F) && SizesKnown && NArgs > 0) {
+    std::string GN = ("gnat_omp_data_guard_" + F->getName()).str();
+    GlobalVariable *DG = M->getNamedGlobal(GN);
+    if (!DG)
+      DG = new GlobalVariable(*M, I8, false, GlobalValue::InternalLinkage,
+                              ConstantInt::get(I8, 0), GN);
+    Value *Already = B.CreateICmpNE(B.CreateLoad(I8, DG), ConstantInt::get(I8, 0));
+    auto *AG = new GlobalVariable(*M, I8, false, GlobalValue::InternalLinkage,
+                                  ConstantInt::get(I8, 0),
+                                  "gnat_omp_data_active_" + Suffix);
+    BasicBlock *BBg = BasicBlock::Create(Ctx, "omp.data.begin", F);
+    BasicBlock *AA = BasicBlock::Create(Ctx, "omp.data.after", F);
+    B.CreateCondBr(Already, AA, BBg);
+    IRBuilder<> DB(BBg);
+    DB.CreateStore(ConstantInt::get(I8, 1), DG);
+    DB.CreateStore(ConstantInt::get(I8, 1), AG);
+    FunctionCallee Beg = M->getOrInsertFunction(
+        "__tgt_target_data_begin",
+        FunctionType::get(Type::getVoidTy(Ctx), {I64, I32, Ptr, Ptr, Ptr, Ptr}, false));
+    DB.CreateCall(Beg, {ConstantInt::get(I64, -1), ConstantInt::get(I32, NArgs),
+                        DB.CreateBitCast(Base, Ptr), DB.CreateBitCast(Base, Ptr),
+                        Sizes, MapTBegin});
+    B.SetInsertPoint(AA);
+    auto Mk = [&](StringRef Name, Type *ET) {
+      return new GlobalVariable(*M, ArrayType::get(ET, ASize), false,
+                                GlobalValue::ExternalLinkage,
+                                ConstantAggregateZero::get(ArrayType::get(ET, ASize)),
+                                (Name + "_" + Suffix).str());
+    };
+    auto *BG = Mk("gnat_omp_data_base", Ptr);
+    auto *SG = Mk("gnat_omp_data_sizes", I64);
+    auto *MG = Mk("gnat_omp_data_maps", I64);
+    for (unsigned I = 0; I < NArgs; ++I) {
+      DB.CreateStore(DB.CreateLoad(Ptr, DB.CreateInBoundsGEP(PtrArr, Base,
+          {DB.getInt32(0), DB.getInt32(I)})),
+          DB.CreateInBoundsGEP(BG->getValueType(), BG, {DB.getInt32(0), DB.getInt32(I)}));
+      DB.CreateStore(DB.CreateLoad(I64, DB.CreateInBoundsGEP(I64Arr, Sizes,
+          {DB.getInt32(0), DB.getInt32(I)})),
+          DB.CreateInBoundsGEP(SG->getValueType(), SG, {DB.getInt32(0), DB.getInt32(I)}));
+      DB.CreateStore(DB.CreateLoad(I64, DB.CreateInBoundsGEP(I64Arr, MapTBegin,
+          {DB.getInt32(0), DB.getInt32(I)})),
+          DB.CreateInBoundsGEP(MG->getValueType(), MG, {DB.getInt32(0), DB.getInt32(I)}));
+    }
+    DB.CreateBr(AA);
+    OldBr->eraseFromParent();
+    ErasedOldBr = true;
+    Pending_Data_Ends.push_back({F, BG, SG, MG, AG, NArgs});
   }
 
   // Without a known extent for every mapped object there is no safe device
@@ -3260,7 +3380,8 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
   Value *Fallback = B.CreateICmpNE(Ret, ConstantInt::get(I32, 0));
   BasicBlock *FB = BasicBlock::Create(Ctx, "omp.target.fallback", F);
   B.CreateCondBr(Fallback, FB, Cont);
-  OldBr->eraseFromParent();
+  if (!ErasedOldBr)
+    OldBr->eraseFromParent();
 
   IRBuilder<> FBB(FB);
   add_thread_push(FBB);

@@ -47,6 +47,7 @@ with GNATLLVM.Records.Field_Ref; use GNATLLVM.Records.Field_Ref;
 with GNATLLVM.Types;             use GNATLLVM.Types;
 with GNATLLVM.Types.Create;      use GNATLLVM.Types.Create;
 with GNATLLVM.Subprograms;       use GNATLLVM.Subprograms;
+with GNATLLVM.Wrapper;           use GNATLLVM.Wrapper;
 with GNATLLVM.Utils;             use GNATLLVM.Utils;
 with GNATLLVM.Variables;         use GNATLLVM.Variables;
 
@@ -678,6 +679,11 @@ package body GNATLLVM.Compile is
             Emit_Decl_Lists (Declarations (N));
             Emit (Handled_Statement_Sequence (N));
             Set_Debug_Pos_At_Node (N);
+            if OpenMP_Target_Data_Pending then
+               Emit_OpenMP_Target_Data_End (Get_Insert_Block);
+               OpenMP_Target_Data_Pending := False;
+               OpenMP_Target_Data_Expr := Empty;
+            end if;
             Pop_Block;
             Pop_Debug_Scope;
 

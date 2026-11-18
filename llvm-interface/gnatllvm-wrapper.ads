@@ -84,6 +84,12 @@ package GNATLLVM.Wrapper is
    --  Attach self-referential `llvm.loop` metadata (vectorize/unroll) to the
    --  latch terminator Term.  Width of 0 or 1 means no explicit width.
 
+   procedure Mark_OpenMP_Target_Data (Func : Value_T)
+     with Import, Convention => C, External_Name => "Mark_OpenMP_Target_Data";
+   procedure Emit_OpenMP_Target_Data_End (BB : Basic_Block_T)
+     with Import, Convention => C,
+          External_Name => "Emit_OpenMP_Target_Data_End";
+
    procedure Distribute_OpenMP_Loop_Over_Lanes (Latch : Basic_Block_T)
      with Import, Convention => C,
           External_Name => "Distribute_OpenMP_Loop_Over_Lanes";
