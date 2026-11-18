@@ -84,6 +84,12 @@ package GNATLLVM.Wrapper is
    --  Attach self-referential `llvm.loop` metadata (vectorize/unroll) to the
    --  latch terminator Term.  Width of 0 or 1 means no explicit width.
 
+   procedure Distribute_OpenMP_Loop_Over_Lanes (Latch : Basic_Block_T)
+     with Import, Convention => C,
+          External_Name => "Distribute_OpenMP_Loop_Over_Lanes";
+   --  Split a Simd loop across warp lanes; uses runtime lane/stride queries
+   --  so the host fallback (stride 1) remains correct.
+
    function Outline_Parallel_For
      (Header      : Basic_Block_T;
       Num_Threads : unsigned;

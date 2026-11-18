@@ -1422,6 +1422,7 @@ package body GNATLLVM.Conditionals is
       OpenMP_Dir       : constant OpenMP_Directive_Kind := OpenMP_Directive;
       OpenMP_Threads   : constant Nat := OpenMP_Num_Threads;
       OpenMP_Reduction : constant Boolean := OpenMP_Has_Reduction;
+      OpenMP_Is_Target : constant Boolean := OpenMP_Dir = OpenMP_Target;
       Simd_Width       : constant unsigned := unsigned (OpenMP_Simdlen);
 
       Parallel_Reversed : Boolean := False;
@@ -1488,6 +1489,9 @@ package body GNATLLVM.Conditionals is
       OpenMP_Simdlen := 0;
       OpenMP_Safelen := 0;
       OpenMP_Has_Reduction := False;
+      if OpenMP_Is_Target then
+         OpenMP_In_Target_Body := True;
+      end if;
 
       if Present (Loop_Identifier) then
          Add_Label_Debug_Info (Loop_Identifier, BB_Start);
@@ -1619,6 +1623,11 @@ package body GNATLLVM.Conditionals is
                     (I_Cmp (Int_NE, Prev, Last), BB_Start, BB_Exit);
                   Emit_OpenMP_Loop_Metadata
                     (Get_Basic_Block_Terminator (Latch));
+                  if OpenMP_Dir = OpenMP_Simd
+                    and then OpenMP_In_Target_Body
+                  then
+                     Distribute_OpenMP_Loop_Over_Lanes (Latch);
+                  end if;
                end;
             end if;
          end;
@@ -1654,6 +1663,9 @@ package body GNATLLVM.Conditionals is
       OpenMP_Simdlen := 0;
       OpenMP_Safelen := 0;
       OpenMP_Has_Reduction := False;
+      if OpenMP_Is_Target then
+         OpenMP_In_Target_Body := False;
+      end if;
 
       Position_Builder_At_End (BB_Exit);
 

@@ -286,6 +286,7 @@ package GNATLLVM is
    --  Reduction clauses are not lowered by the native GNAT-LLVM path yet;
    --  keep such loops sequential instead of producing a wrong checksum.
    OpenMP_Has_Reduction : Boolean := False;
+   OpenMP_In_Target_Body : Boolean := False;
 
    DI_Builder          : DI_Builder_T;
    --  The current LLVM Debug Info builder

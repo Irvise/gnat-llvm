@@ -2174,6 +2174,80 @@ extern "C" void Set_Loop_Metadata_For_Vectorize(LLVMValueRef Term_Ref,
   Term->setMetadata(LLVMContext::MD_loop, Loop_ID);
 }
 
+// Runtime queries used by Simd loops distributed across warp lanes.  On the
+// host fallback a single lane covers the whole loop (stride 1); the NVPTX
+// image redefines these to use lane id and a 32-wide stride.
+static Function *Get_Or_Create_Lane_Fn(Module *M, bool Stride) {
+  const char *Name = Stride ? "gnat_omp_get_lane_stride"
+                            : "gnat_omp_get_lane_num";
+  if (Function *F = M->getFunction(Name))
+    return F;
+  LLVMContext &Ctx = M->getContext();
+  Function *F = Function::Create(
+      FunctionType::get(Type::getInt32Ty(Ctx), {}, false),
+      GlobalValue::InternalLinkage, Name, M);
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  B.CreateRet(ConstantInt::get(Type::getInt32Ty(Ctx), Stride ? 32 : 0));
+  return F;
+}
+
+extern "C" void Distribute_OpenMP_Loop_Over_Lanes(LLVMValueRef LatchRef) {
+  auto *Latch = dyn_cast<BasicBlock>(unwrap(LatchRef));
+  if (!Latch)
+    return;
+  Function *F = Latch->getParent();
+  Module *M = F->getParent();
+  ICmpInst *Cmp = nullptr;
+  StoreInst *IncStore = nullptr;
+  BinaryOperator *Step = nullptr;
+  for (Instruction &I : *Latch) {
+    if (auto *C = dyn_cast<ICmpInst>(&I))
+      Cmp = C;
+    if (auto *SI = dyn_cast<StoreInst>(&I))
+      if (auto *BO = dyn_cast<BinaryOperator>(SI->getValueOperand()))
+        if (BO->getOpcode() == Instruction::Add)
+          for (unsigned Op = 0; Op < 2; ++Op)
+            if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(Op)))
+              if (CI->isOne()) {
+                IncStore = SI;
+                Step = BO;
+              }
+  }
+  if (!Cmp || !IncStore || !Step)
+    return;
+  StoreInst *InitStore = nullptr;
+  for (BasicBlock &BB : *F) {
+    if (&BB == Latch)
+      continue;
+    for (Instruction &I : BB)
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        if (SI->getPointerOperand() == IncStore->getPointerOperand()) {
+          InitStore = SI;
+          break;
+        }
+    if (InitStore)
+      break;
+  }
+  if (!InitStore)
+    return;
+  Value *Lo = InitStore->getValueOperand();
+  Value *Hi = Cmp->getOperand(1);
+  IRBuilder<> PB(InitStore);
+  Value *Lane = PB.CreateCall(Get_Or_Create_Lane_Fn(M, false));
+  Value *Stride = PB.CreateCall(Get_Or_Create_Lane_Fn(M, true));
+  Value *Start = PB.CreateAdd(Lo, Lane);
+  Value *Span = PB.CreateSub(Hi, Lo);
+  Value *Fits = PB.CreateICmpSLE(Lane, Span);
+  Value *Quot = PB.CreateSDiv(PB.CreateSub(Span, Lane), Stride);
+  Value *Last = PB.CreateAdd(Start, PB.CreateMul(Quot, Stride));
+  Value *Empty = PB.CreateSub(Lo, PB.getInt32(1));
+  Value *LastSel = PB.CreateSelect(Fits, Last, Empty);
+  InitStore->setOperand(0, PB.CreateSExtOrTrunc(Start, Lo->getType()));
+  Cmp->setOperand(1, PB.CreateSExtOrTrunc(LastSel, Hi->getType()));
+  Step->setOperand(1, PB.CreateSExtOrTrunc(Stride, Step->getType()));
+}
+
 // ---------------------------------------------------------------------------
 // Native OpenMP parallel-for outlining
 // ---------------------------------------------------------------------------
@@ -2391,6 +2465,29 @@ static bool Emit_OpenMP_NVPTX_Image(Module *M, ArrayRef<OMPRegion> Regions,
         G.getName().starts_with("gnat.omp.region.id"))
       G.eraseFromParent();
 
+  // If CCG emitted a lane-distributed Simd loop, provide the device-side
+  // lane queries and make the outer loop run one iteration per warp.
+  bool HasLaneFn = DM->getFunction("gnat_omp_get_lane_num") != nullptr;
+  if (HasLaneFn) {
+    auto IntrLane = [&](Intrinsic::ID ID) {
+      return Intrinsic::getOrInsertDeclaration(DM.get(), ID);
+    };
+    Function *TidX = IntrLane(static_cast<Intrinsic::ID>(
+        Intrinsic::nvvm_read_ptx_sreg_tid_x));
+    Function *Lane = DM->getFunction("gnat_omp_get_lane_num");
+    Function *Stride = DM->getFunction("gnat_omp_get_lane_stride");
+    if (Lane) {
+      Lane->deleteBody();
+      IRBuilder<> LB(BasicBlock::Create(Ctx, "entry", Lane));
+      LB.CreateRet(LB.CreateAnd(LB.CreateCall(TidX), LB.getInt32(31)));
+    }
+    if (Stride) {
+      Stride->deleteBody();
+      IRBuilder<> SB(BasicBlock::Create(Ctx, "entry", Stride));
+      SB.CreateRet(SB.getInt32(32));
+    }
+  }
+
   // Define the OpenMP thread queries from NVPTX special registers.
   auto DefineTid = [&](StringRef Name, bool IsNum) {
     Function *F = DM->getFunction(Name);
@@ -2418,6 +2515,9 @@ static bool Emit_OpenMP_NVPTX_Image(Module *M, ArrayRef<OMPRegion> Regions,
       Value *CTA = B.CreateCall(Ctaid);
       Result = B.CreateAdd(T, B.CreateMul(CTA, NT));
     }
+    if (HasLaneFn)
+      Result = B.CreateSDiv(Result, ConstantInt::get(
+          Type::getInt32Ty(Ctx), 32));
     B.CreateRet(B.CreateZExtOrTrunc(Result, F->getReturnType()));
   };
   DefineTid("omp_get_thread_num", false);
