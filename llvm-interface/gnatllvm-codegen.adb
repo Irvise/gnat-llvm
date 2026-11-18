@@ -244,9 +244,9 @@ package body GNATLLVM.Codegen is
          To_Free       := CPU;
          CPU           := new String'(Switch_Value (S, "-mcpu="));
       elsif Starts_With (S, "-mtune=") then
-         if CPU.all = "generic" and then Arch = null then
+         if CPU /= null and then CPU.all = "generic" and then Arch = null then
             To_Free    := CPU;
-            CPU        := new String'(Switch_Value (S, "-march="));
+            CPU        := new String'(Switch_Value (S, "-mtune="));
          end if;
 
       --  -mabi= tells the code generator which ABI to use on some

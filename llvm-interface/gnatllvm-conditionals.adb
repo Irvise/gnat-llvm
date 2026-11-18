@@ -1413,11 +1413,15 @@ package body GNATLLVM.Conditionals is
       --  Emit the body of the loop
 
       --  Consume any pending pragma OpenMP request now, so that loops nested
-      --  inside this loop's body do not swallow it.
+      --  inside this loop's body do not swallow it.  The pragma applies to the
+      --  *first* loop statement that follows it; without clearing here the
+      --  inner loop also sees OpenMP_Pending and both loops get outlined,
+      --  giving nested forks / invalid cross-function IR.
 
       OpenMP_Requested : constant Boolean := OpenMP_Pending;
       OpenMP_Dir       : constant OpenMP_Directive_Kind := OpenMP_Directive;
       OpenMP_Threads   : constant Nat := OpenMP_Num_Threads;
+      OpenMP_Reduction : constant Boolean := OpenMP_Has_Reduction;
       Simd_Width       : constant unsigned := unsigned (OpenMP_Simdlen);
 
       Parallel_Reversed : Boolean := False;
@@ -1440,6 +1444,7 @@ package body GNATLLVM.Conditionals is
          OpenMP_Num_Threads := 0;
          OpenMP_Simdlen := 0;
          OpenMP_Safelen := 0;
+         OpenMP_Has_Reduction := False;
       end Emit_OpenMP_Loop_Metadata;
 
       Loop_Identifier : constant Opt_E_Loop_Id             :=
@@ -1475,6 +1480,15 @@ package body GNATLLVM.Conditionals is
       end Emit_Loop_Body;
 
    begin
+      --  The pragma has been captured in the locals above.  Clear the global
+      --  state immediately so nested loops emitted below cannot consume it.
+      OpenMP_Pending := False;
+      OpenMP_Directive := OpenMP_None;
+      OpenMP_Num_Threads := 0;
+      OpenMP_Simdlen := 0;
+      OpenMP_Safelen := 0;
+      OpenMP_Has_Reduction := False;
+
       if Present (Loop_Identifier) then
          Add_Label_Debug_Info (Loop_Identifier, BB_Start);
       end if;
@@ -1611,12 +1625,14 @@ package body GNATLLVM.Conditionals is
       end if;
 
       --  A pending parallel-for pragma turns the loop into a libomp microtask.
-      --  A target region is lowered the same way for now: the host team
-      --  executes the region (host device fallback).  Emitting a device image
-      --  and dispatching through libomptarget's __tgt_target_kernel is the
-      --  next step (see docs/GNAT_LLVM_OPENMP.md).
+      --  A target region is outlined the same way; it is dispatched through
+      --  libomptarget's __tgt_target_kernel with a host/x86_64 image and, when
+      --  available, an NVPTX image.  The host team is only the fallback when
+      --  no compatible device image is registered (see
+      --  docs/GNAT_LLVM_OPENMP.md).
 
       if Is_For_Loop and then OpenMP_Requested
+        and then not OpenMP_Reduction
         and then (OpenMP_Dir = OpenMP_Parallel_For
                   or else OpenMP_Dir = OpenMP_Parallel_For_Simd
                   or else OpenMP_Dir = OpenMP_Target)
@@ -1637,6 +1653,7 @@ package body GNATLLVM.Conditionals is
       OpenMP_Num_Threads := 0;
       OpenMP_Simdlen := 0;
       OpenMP_Safelen := 0;
+      OpenMP_Has_Reduction := False;
 
       Position_Builder_At_End (BB_Exit);
 

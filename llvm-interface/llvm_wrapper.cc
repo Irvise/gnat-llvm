@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 #include "llvm-c/Types.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -24,10 +26,13 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
@@ -2179,9 +2184,11 @@ namespace {
 // (High = false) or upper (High = true) bound of [Lo, Hi] for a static split
 // across the current OpenMP team.  Implemented in IR so that no extra runtime
 // object has to be linked beyond libomp itself.
-Function *Get_Or_Create_Range_Fn(Module *M, bool High) {
+Function *Get_Or_Create_Range_Fn(Module *M, bool High, bool Strided) {
   const char *Name =
-      High ? "gnat.omp.thread_high" : "gnat.omp.thread_low";
+      Strided ? (High ? "gnat.omp.thread_high.strided"
+                      : "gnat.omp.thread_low.strided")
+              : (High ? "gnat.omp.thread_high" : "gnat.omp.thread_low");
   if (Function *Existing = M->getFunction(Name))
     return Existing;
 
@@ -2208,31 +2215,52 @@ Function *Get_Or_Create_Range_Fn(Module *M, bool High) {
   // A team has at least one thread.
   Value *NumPos = B.CreateICmpSGT(Num, B.getInt64(0));
   Value *N = B.CreateSelect(NumPos, Num, B.getInt64(1));
-  // Clamp tid into [0, N-1].
+  // Clamp tid into [0, N-1], then drop ids without any work.
   Value *TidInTeam =
       B.CreateSelect(B.CreateICmpSLT(Tid, N), Tid, B.CreateSub(N, B.getInt64(1)));
 
-  Value *Base = B.CreateSDiv(T, N);
-  Value *Rem = B.CreateSRem(T, N);
+  // T and N are non-negative counts here; unsigned division gives the
+  // floor semantics Ada uses for `mod` and avoids signed-truncation bias.
+  Value *Base = B.CreateUDiv(T, N);
+  Value *Rem = B.CreateURem(T, N);
+  Value *HasExtra = B.CreateICmpULT(TidInTeam, Rem);
   Value *Extra =
-      B.CreateSelect(B.CreateICmpSLT(TidInTeam, Rem), B.getInt64(1),
-                     B.getInt64(0));
-  Value *Offset =
-      B.CreateAdd(B.CreateMul(TidInTeam, Base),
-                  B.CreateSelect(B.CreateICmpSLT(TidInTeam, Rem), TidInTeam, Rem));
-  Value *LowP = B.CreateAdd(Lo, Offset);
+      B.CreateSelect(HasExtra, B.getInt64(1), B.getInt64(0));
+
+  Value *LowP, *HighP;
+  if (Strided) {
+    // Cyclic split: thread t runs Lo+t, Lo+t+N, ... This makes consecutive
+    // CUDA lanes touch consecutive elements on every iteration (coalesced
+    // global memory accesses), unlike a contiguous chunk per thread.
+    Value *Start = B.CreateAdd(Lo, TidInTeam);
+    Value *Count = B.CreateAdd(Base, Extra);
+    // Threads whose id >= total have no work: start past the end and set the
+    // upper bound below it so the empty-range guard skips the loop.
+    Value *NoWork = B.CreateICmpUGE(TidInTeam, T);
+    Value *RealStart = B.CreateSelect(NoWork, B.CreateAdd(Lo, T), Start);
+    Value *RealCount = B.CreateSelect(NoWork, B.getInt64(0), Count);
+    Value *Span =
+        B.CreateMul(B.CreateSub(RealCount, B.getInt64(1)), N);
+    LowP = RealStart;
+    HighP = B.CreateAdd(RealStart, Span);
+  } else {
+    Value *Offset =
+        B.CreateAdd(B.CreateMul(TidInTeam, Base),
+                    B.CreateSelect(HasExtra, TidInTeam, Rem));
+    LowP = B.CreateAdd(Lo, Offset);
+    HighP = B.CreateSub(B.CreateAdd(LowP, B.CreateAdd(Base, Extra)),
+                        B.getInt64(1));
+  }
 
   if (!High)
     return B.CreateRet(LowP), F;
-
-  Value *Count = B.CreateAdd(Base, Extra);
-  return B.CreateRet(B.CreateSub(B.CreateAdd(LowP, Count), B.getInt64(1))), F;
+  return B.CreateRet(HighP), F;
 }
 
 // Emit a call to the range helper at At, returning a value of type Ty.
 Value *Range_Call(Module *M, bool High, Value *Lo, Value *Hi, Type *Ty,
-                  Instruction *At) {
-  Function *F = Get_Or_Create_Range_Fn(M, High);
+                  Instruction *At, bool Strided = false) {
+  Function *F = Get_Or_Create_Range_Fn(M, High, Strided);
   IRBuilder<> B(At);
   Type *I64 = B.getInt64Ty();
   Value *L = B.CreateSExtOrTrunc(Lo, I64);
@@ -2265,138 +2293,188 @@ Constant *Get_OpenMP_Target_Ident(Module *M) {
                             Init, "gnat.omp.target.ident");
 }
 
-// Register an (initially empty) libomptarget binary descriptor so that
-// __tgt_target_kernel works and reports "no image" instead of crashing.  A
-// device image is added later when the offload toolchain is wired in.
-void Ensure_OpenMP_Registration(Module *M) {
-  if (M->getNamedGlobal("gnat.omp.bin.desc"))
-    return;
-
-  LLVMContext &Ctx = M->getContext();
-  Type *I32 = Type::getInt32Ty(Ctx);
-  Type *Void = Type::getVoidTy(Ctx);
-  Type *Ptr = PointerType::getUnqual(Ctx);
-  Constant *Null = ConstantPointerNull::get(cast<PointerType>(Ptr));
-
-  StructType *EntryTy = offloading::getEntryTy(*M);
-  Type *EntryPtr = PointerType::getUnqual(Ctx);
-  StructType *ImgTy =
-      StructType::get(Ctx, {Ptr, Ptr, EntryPtr, EntryPtr});
-  StructType *DescTy =
-      StructType::get(Ctx, {I32, Ptr, EntryPtr, EntryPtr});
-
-  auto *Desc = new GlobalVariable(
-      *M, DescTy, false, GlobalValue::InternalLinkage,
-      ConstantStruct::get(DescTy,
-                          {ConstantInt::get(I32, 0), Null, Null, Null}),
-      "gnat.omp.bin.desc");
-
-  FunctionCallee Reg = M->getOrInsertFunction(
-      "__tgt_register_lib",
-      FunctionType::get(Void, {Ptr}, false));
-  Function *Ctor = Function::Create(FunctionType::get(Void, false),
-                                    GlobalValue::InternalLinkage,
-                                    "gnat.omp.register", M);
-  IRBuilder<> CB(BasicBlock::Create(Ctx, "entry", Ctor));
-  CB.CreateCall(Reg, {Desc});
-  CB.CreateRetVoid();
-
-  StructType *CtorTy = StructType::get(Ctx, {I32, Ptr, Ptr});
-  Constant *Entry = ConstantStruct::get(
-      CtorTy, {ConstantInt::get(I32, 65535), Ctor, Null});
-  if (GlobalVariable *Ctors = M->getNamedGlobal("llvm.global_ctors")) {
-    auto *Old = cast<ConstantArray>(Ctors->getInitializer());
-    SmallVector<Constant *, 8> Vals;
-    for (Value *Op : Old->operands())
-      Vals.push_back(cast<Constant>(Op));
-    Vals.push_back(Entry);
-    ArrayType *AT = ArrayType::get(CtorTy, Vals.size());
-    Ctors->setInitializer(ConstantArray::get(AT, Vals));
-    Ctors->mutateType(PointerType::getUnqual(Ctx));
-  } else {
-    ArrayType *AT = ArrayType::get(CtorTy, 1);
-    new GlobalVariable(*M, AT, false, GlobalValue::AppendingLinkage,
-                       ConstantArray::get(AT, {Entry}), "llvm.global_ctors");
-  }
-}
-
 // Emit a device image for the outlined region and register it with
 // libomptarget.  The current implementation builds a host (x86_64) image, so
 // the runtime's host plugin executes the kernel; the same machinery can emit
 // amdgcn/nvptx images once a device toolchain is available.
 // Best-effort size of the object a mapped pointer refers to.
-static uint64_t Infer_Mapped_Size(Value *V, const DataLayout &DL) {
-  if (auto *AI = dyn_cast<AllocaInst>(V))
-    return DL.getTypeAllocSize(AI->getAllocatedType());
+static Value *Build_Mapped_Size(IRBuilder<> &B, Value *V,
+                                const DataLayout &DL, bool &Known) {
+  Type *I64 = B.getInt64Ty();
+  if (auto *AI = dyn_cast<AllocaInst>(V)) {
+    uint64_t Elem = DL.getTypeAllocSize(AI->getAllocatedType());
+    if (!AI->isArrayAllocation())
+      return ConstantInt::get(I64, Elem);
+    // Ada arrays sized by a runtime N are emitted as VLAs: alloca T, i64 N.
+    // The element count dominates the target call, so multiply it by the
+    // element size in the host IR and let libomptarget see the real byte count.
+    Value *Count = B.CreateZExtOrTrunc(AI->getArraySize(), I64);
+    return B.CreateMul(Count, ConstantInt::get(I64, Elem));
+  }
   if (auto *GV = dyn_cast<GlobalVariable>(V))
-    return DL.getTypeAllocSize(GV->getValueType());
+    return ConstantInt::get(I64, DL.getTypeAllocSize(GV->getValueType()));
   if (auto *BC = dyn_cast<BitCastOperator>(V))
-    return Infer_Mapped_Size(BC->getOperand(0), DL);
+    return Build_Mapped_Size(B, BC->getOperand(0), DL, Known);
   if (auto *GEP = dyn_cast<GEPOperator>(V))
-    return Infer_Mapped_Size(GEP->getPointerOperand(), DL);
-  return 0;
+    return Build_Mapped_Size(B, GEP->getPointerOperand(), DL, Known);
+  // The pointer's extent is not statically known here (e.g. a heap pointer
+  // passed in from a call).  Do not emit a device image for this region:
+  // mapping zero bytes would leave the kernel reading unmapped device memory.
+  Known = false;
+  return ConstantInt::get(I64, 0);
 }
 
-static bool Emit_OpenMP_Device_Image(Module *M, Function *E,
-                                     GlobalVariable *RegionId,
-                                     StringRef KernelName, unsigned NArgs) {
+// Emit an NVPTX (PTX) device image for the outlined region.  The image is
+// packed in the libomptarget offload-binary format with the nvptx64 triple and
+// sm_89 arch, so the CUDA plugin can JIT it with ptxas.  omp_get_thread_num /
+// omp_get_num_threads are defined from NVPTX special registers so the existing
+// static range helpers split the loop across the launched CUDA threads.
+struct OMPRegion {
+  std::string EName;
+  GlobalVariable *RegionId;
+  std::string KernelName;
+  unsigned NArgs;
+};
+static SmallVector<OMPRegion, 4> Pending_OMP_Regions;
+
+extern "C" void Register_OpenMP_Target(Module *M, Function *E,
+                                       GlobalVariable *RegionId,
+                                       const char *KernelName,
+                                       unsigned NArgs) {
+  Pending_OMP_Regions.push_back({E->getName().str(), RegionId, KernelName,
+                                 NArgs});
+}
+
+// Build one NVPTX cubin containing all target kernels of the translation unit.
+static bool Emit_OpenMP_NVPTX_Image(Module *M, ArrayRef<OMPRegion> Regions,
+                                    SmallVectorImpl<char> &Bytes) {
+  if (Regions.empty())
+    return false;
   LLVMContext &Ctx = M->getContext();
   Type *Ptr = PointerType::getUnqual(Ctx);
-  Type *I64 = Type::getInt64Ty(Ctx);
   Type *Void = Type::getVoidTy(Ctx);
-  FunctionType *EFT = E->getFunctionType();
-
-  if (EFT->getNumParams() != NArgs || NArgs == 0)
-    return false;
-  for (Type *T : EFT->params())
-    if (!T->isPointerTy())
-      return false;
-
-  // Clone the whole module (cross-module CloneFunctionInto crashes LLVM 21),
-  // then prune everything except the kernel with GlobalDCE.
-  ValueToValueMapTy VMap;
-  std::unique_ptr<Module> DM = CloneModule(*M, VMap);
-  DM->setModuleIdentifier("gnat.omp.device");
-  DM->setTargetTriple(Triple(StringRef("x86_64-pc-linux-gnu")));
-  DM->setDataLayout(M->getDataLayout());
-  if (GlobalVariable *G = DM->getNamedGlobal("llvm.global_ctors"))
-    G->eraseFromParent();
-  if (GlobalVariable *G = DM->getNamedGlobal("llvm.used"))
-    G->eraseFromParent();
-
-  Function *DE = cast<Function>(VMap[E]);
-  DE->setLinkage(GlobalValue::InternalLinkage);
-
-  // Device-side range helpers: the host kernel executes the whole range.
-  for (const char *Name : {"gnat.omp.thread_low", "gnat.omp.thread_high"}) {
-    Function *F = DM->getFunction(Name);
-    if (!F)
+  for (const OMPRegion &R : Regions) {
+    Function *Source = M->getFunction(R.EName);
+    if (!Source)
       continue;
-    bool High = StringRef(Name).ends_with("high");
-    F->deleteBody();
-    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
-    B.CreateRet(High ? F->getArg(1) : F->getArg(0));
+    FunctionType *EFT = Source->getFunctionType();
+    if (EFT->getNumParams() != R.NArgs || R.NArgs == 0)
+      return false;
   }
 
-  // libomptarget (kernel-arg ABI v3) prepends an implicit kernel launch
-  // environment pointer, so the device kernel takes one extra leading ptr.
-  SmallVector<Type *, 8> KParams = {Ptr};
-  for (Type *T : EFT->params())
-    KParams.push_back(T);
-  Function *K = Function::Create(
-      FunctionType::get(Void, KParams, false), GlobalValue::ExternalLinkage,
-      KernelName, DM.get());
-  IRBuilder<> KB(BasicBlock::Create(Ctx, "entry", K));
-  SmallVector<Value *, 8> Fwd;
-  for (unsigned I = 0; I < EFT->getNumParams(); ++I)
-    Fwd.push_back(K->getArg(I + 1));
-  KB.CreateCall(DE, Fwd);
-  KB.CreateRetVoid();
+  const char *TripleStr = "nvptx64-nvidia-cuda";
+  const char *Arch = "sm_89";
+  Triple TT = Triple(StringRef(TripleStr));
+  std::string Err;
+  const Target *T = TargetRegistry::lookupTarget(TT, Err);
+  if (!T)
+    return false;
+  llvm::TargetOptions Opt;
+  std::unique_ptr<TargetMachine> TM(T->createTargetMachine(
+      TT, Arch, "", Opt, std::nullopt, std::nullopt, CodeGenOptLevel::None));
+  if (!TM)
+    return false;
 
-  // Keep only functions reachable from the kernel (the host module was cloned
-  // in full so we do not depend on cross-module cloning or a DCE pass).
+  ValueToValueMapTy VMap;
+  std::unique_ptr<Module> DM = CloneModule(*M, VMap);
+  DM->setModuleIdentifier("gnat.omp.nvptx.device");
+  DM->setTargetTriple(TT);
+  DM->setDataLayout(TM->createDataLayout());
+  for (const char *Name : {"llvm.global_ctors", "llvm.used",
+                           "llvm.compiler.used"})
+    if (GlobalVariable *G = DM->getNamedGlobal(Name))
+      G->eraseFromParent();
+  if (NamedMDNode *N = DM->getNamedMetadata("llvm.offloading.symbols"))
+    DM->eraseNamedMetadata(N);
+  for (GlobalVariable &G : llvm::make_early_inc_range(DM->globals()))
+    if (G.getName().contains("offloading") ||
+        G.getName().starts_with("gnat.omp.region.id"))
+      G.eraseFromParent();
+
+  // Define the OpenMP thread queries from NVPTX special registers.
+  auto DefineTid = [&](StringRef Name, bool IsNum) {
+    Function *F = DM->getFunction(Name);
+    if (!F)
+      return;
+    F->deleteBody();
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    auto Intr = [&](Intrinsic::ID ID) {
+      return Intrinsic::getOrInsertDeclaration(DM.get(), ID);
+    };
+    Function *Tid = Intr(static_cast<Intrinsic::ID>(
+        Intrinsic::nvvm_read_ptx_sreg_tid_x));
+    Function *NTid = Intr(static_cast<Intrinsic::ID>(
+        Intrinsic::nvvm_read_ptx_sreg_ntid_x));
+    Function *Ctaid = Intr(static_cast<Intrinsic::ID>(
+        Intrinsic::nvvm_read_ptx_sreg_ctaid_x));
+    Function *NCtaid = Intr(static_cast<Intrinsic::ID>(
+        Intrinsic::nvvm_read_ptx_sreg_nctaid_x));
+    Value *Result;
+    if (IsNum)
+      Result = B.CreateMul(B.CreateCall(NTid), B.CreateCall(NCtaid));
+    else {
+      Value *T = B.CreateCall(Tid);
+      Value *NT = B.CreateCall(NTid);
+      Value *CTA = B.CreateCall(Ctaid);
+      Result = B.CreateAdd(T, B.CreateMul(CTA, NT));
+    }
+    B.CreateRet(B.CreateZExtOrTrunc(Result, F->getReturnType()));
+  };
+  DefineTid("omp_get_thread_num", false);
+  DefineTid("omp_get_num_threads", true);
+
+  SmallVector<Function *, 4> Kernels;
+  for (const OMPRegion &R : Regions) {
+    Function *Source = M->getFunction(R.EName);
+    if (!Source)
+      continue;
+    FunctionType *EFT = Source->getFunctionType();
+    Function *DE = DM->getFunction(R.EName);
+    if (!DE)
+      continue;
+    // Generic-mode environment: without it libomptarget launches in BARE mode
+    // with zero threads and cuLaunchKernel fails with INVALID_VALUE.
+    Type *I8 = Type::getInt8Ty(Ctx);
+    Type *I32 = Type::getInt32Ty(Ctx);
+    StructType *ConfigTy =
+        StructType::get(Ctx, {I8, I8, I8, I32, I32, I32, I32, I32, I32});
+    StructType *EnvTy = StructType::get(Ctx, {ConfigTy, Ptr, Ptr});
+    auto *Config = ConstantStruct::get(
+        ConfigTy, {ConstantInt::get(I8, 2), ConstantInt::get(I8, 2),
+                   ConstantInt::get(I8, 2), ConstantInt::get(I32, -1),
+                   ConstantInt::get(I32, -1), ConstantInt::get(I32, -1),
+                   ConstantInt::get(I32, -1), ConstantInt::get(I32, 0),
+                   ConstantInt::get(I32, 0)});
+    auto *Env = ConstantStruct::get(
+        EnvTy, {Config, ConstantPointerNull::get(cast<PointerType>(Ptr)),
+                ConstantPointerNull::get(cast<PointerType>(Ptr))});
+    auto *EnvGV = new GlobalVariable(
+        *DM, EnvTy, true, GlobalValue::WeakODRLinkage, Env,
+        R.KernelName + "_kernel_environment", nullptr,
+        GlobalValue::NotThreadLocal,
+        DM->getDataLayout().getDefaultGlobalsAddressSpace());
+    EnvGV->setVisibility(GlobalValue::ProtectedVisibility);
+
+    DE->setLinkage(GlobalValue::InternalLinkage);
+    SmallVector<Type *, 8> KParams(1 + EFT->getNumParams(), Ptr);
+    Function *K = Function::Create(FunctionType::get(Void, KParams, false),
+                                   GlobalValue::ExternalLinkage,
+                                   R.KernelName, DM.get());
+    K->setCallingConv(llvm::CallingConv::PTX_Kernel);
+    IRBuilder<> KB(BasicBlock::Create(Ctx, "entry", K));
+    SmallVector<Value *, 8> Fwd;
+    for (unsigned I = 0; I < EFT->getNumParams(); ++I) {
+      Type *PT = EFT->getParamType(I);
+      Value *A = K->getArg(I + 1);
+      Fwd.push_back(PT->isPointerTy() ? A : KB.CreateLoad(PT, A));
+    }
+    KB.CreateCall(DE, Fwd);
+    KB.CreateRetVoid();
+    Kernels.push_back(K);
+  }
+
   SmallPtrSet<Function *, 32> Live;
-  SmallVector<Function *, 32> Work{K};
+  SmallVector<Function *, 32> Work(Kernels.begin(), Kernels.end());
   while (!Work.empty()) {
     Function *F = Work.pop_back_val();
     if (!Live.insert(F).second)
@@ -2414,9 +2492,136 @@ static bool Emit_OpenMP_Device_Image(Module *M, Function *E,
     if (!G.isDeclaration() && G.hasLocalLinkage() && G.use_empty())
       G.eraseFromParent();
 
-  // Compile the device module for the host triple.
-  std::string Err;
+  if (std::getenv("GNAT_LLVM_VERIFY_DEVICE_IR"))
+    verifyModule(*DM, &errs());
+  SmallVector<char, 0> PTX;
+  raw_svector_ostream PTXOS(PTX);
+  legacy::PassManager PM;
+  if (TM->addPassesToEmitFile(PM, PTXOS, nullptr,
+                              CodeGenFileType::AssemblyFile))
+    return false;
+  PM.run(*DM);
+
+  auto PtxasOrErr = sys::findProgramByName("ptxas");
+  if (!PtxasOrErr) {
+    if (sys::fs::exists("/usr/local/cuda/bin/ptxas"))
+      PtxasOrErr = std::string("/usr/local/cuda/bin/ptxas");
+    else
+      return false;
+  }
+  SmallString<128> PTXPath, CubinPath;
+  int PTXFD = -1;
+  if (sys::fs::createTemporaryFile("gnat-omp-nvptx", "ptx", PTXFD, PTXPath))
+    return false;
+  {
+    raw_fd_ostream PTXFile(PTXFD, true);
+    PTXFile.write(PTX.data(), PTX.size());
+  }
+  CubinPath = PTXPath;
+  CubinPath += ".cubin";
+  SmallVector<StringRef, 8> PtxasArgs = {
+      *PtxasOrErr, "-m64", "-O3", "--gpu-name", Arch,
+      "-o", CubinPath, PTXPath};
+  std::string ExecErr;
+  int RC = sys::ExecuteAndWait(*PtxasOrErr, PtxasArgs, std::nullopt, {}, 0, 0,
+                               &ExecErr);
+  if (RC != 0) {
+    errs() << "gnat-omp: ptxas failed: " << ExecErr << "\n";
+    sys::fs::remove(PTXPath);
+    return false;
+  }
+  sys::fs::remove(PTXPath);
+  auto CubinOrErr = MemoryBuffer::getFile(CubinPath);
+  sys::fs::remove(CubinPath);
+  if (!CubinOrErr)
+    return false;
+
+  object::OffloadBinary::OffloadingImage Img;
+  Img.TheImageKind = object::IMG_Object;
+  Img.TheOffloadKind = object::OFK_OpenMP;
+  Img.Flags = 0;
+  Img.StringData["triple"] = TripleStr;
+  Img.StringData["arch"] = Arch;
+  Img.Image = std::move(*CubinOrErr);
+  SmallString<0> ImageBytes = object::OffloadBinary::write(Img);
+  Bytes.append(ImageBytes.begin(), ImageBytes.end());
+  return true;
+}
+
+// Build one host-plugin shared object containing all target kernels.
+static bool Emit_OpenMP_Host_Image(Module *M, ArrayRef<OMPRegion> Regions,
+                                   SmallVectorImpl<char> &Bytes) {
+  LLVMContext &Ctx = M->getContext();
+  Type *Ptr = PointerType::getUnqual(Ctx);
+  Type *Void = Type::getVoidTy(Ctx);
+  ValueToValueMapTy VMap;
+  std::unique_ptr<Module> DM = CloneModule(*M, VMap);
+  DM->setModuleIdentifier("gnat.omp.device");
+  DM->setTargetTriple(Triple(StringRef("x86_64-pc-linux-gnu")));
+  DM->setDataLayout(M->getDataLayout());
+  for (const char *Name : {"llvm.global_ctors", "llvm.used",
+                           "llvm.compiler.used"})
+    if (GlobalVariable *G = DM->getNamedGlobal(Name))
+      G->eraseFromParent();
+  if (NamedMDNode *N = DM->getNamedMetadata("llvm.offloading.symbols"))
+    DM->eraseNamedMetadata(N);
+
+  SmallVector<Function *, 4> Kernels;
+  for (const OMPRegion &R : Regions) {
+    Function *DE = DM->getFunction(R.EName);
+    if (!DE)
+      continue;
+    DE->setLinkage(GlobalValue::InternalLinkage);
+    for (const char *Name : {"gnat.omp.thread_low", "gnat.omp.thread_high"}) {
+      Function *F = DM->getFunction(Name);
+      if (!F)
+        continue;
+      bool High = StringRef(Name).ends_with("high");
+      F->deleteBody();
+      IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+      B.CreateRet(High ? F->getArg(1) : F->getArg(0));
+    }
+    Function *Source = M->getFunction(R.EName);
+    if (!Source)
+      continue;
+    FunctionType *EFT = Source->getFunctionType();
+    SmallVector<Type *, 8> KParams(1 + EFT->getNumParams(), Ptr);
+    Function *K = Function::Create(FunctionType::get(Void, KParams, false),
+                                   GlobalValue::ExternalLinkage,
+                                   R.KernelName, DM.get());
+    IRBuilder<> KB(BasicBlock::Create(Ctx, "entry", K));
+    SmallVector<Value *, 8> Fwd;
+    for (unsigned I = 0; I < EFT->getNumParams(); ++I) {
+      Type *PT = EFT->getParamType(I);
+      Value *A = K->getArg(I + 1);
+      Fwd.push_back(PT->isPointerTy() ? A : KB.CreateLoad(PT, A));
+    }
+    KB.CreateCall(DE, Fwd);
+    KB.CreateRetVoid();
+    Kernels.push_back(K);
+  }
+
+  SmallPtrSet<Function *, 32> Live;
+  SmallVector<Function *, 32> Work(Kernels.begin(), Kernels.end());
+  while (!Work.empty()) {
+    Function *F = Work.pop_back_val();
+    if (!Live.insert(F).second)
+      continue;
+    for (BasicBlock &BB : *F)
+      for (Instruction &I : BB)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (Function *Callee = CB->getCalledFunction())
+            Work.push_back(Callee);
+  }
+  for (Function &F : llvm::make_early_inc_range(*DM))
+    if (!F.isDeclaration() && !Live.count(&F))
+      F.eraseFromParent();
+  for (GlobalVariable &G : llvm::make_early_inc_range(DM->globals()))
+    if (!G.isDeclaration() && G.hasLocalLinkage() && G.use_empty())
+      G.eraseFromParent();
+
   Triple TT(StringRef("x86_64-pc-linux-gnu"));
+  std::string Err;
   const Target *T = TargetRegistry::lookupTarget(TT, Err);
   if (!T)
     return false;
@@ -2433,9 +2638,6 @@ static bool Emit_OpenMP_Device_Image(Module *M, Function *E,
     return false;
   PM.run(*DM);
 
-  // The host plugin dlopen()s the image, so it must be a shared object, not a
-  // relocatable object.  Write the object out and link it with the system
-  // linker driver (the only external tool this lowering needs).
   SmallString<128> ObjPath;
   int FD = -1;
   if (sys::fs::createTemporaryFile("gnat-omp-dev", "o", FD, ObjPath))
@@ -2469,7 +2671,6 @@ static bool Emit_OpenMP_Device_Image(Module *M, Function *E,
     return false;
   }
   std::unique_ptr<MemoryBuffer> SoBuf = std::move(*SoOrErr);
-
   object::OffloadBinary::OffloadingImage Img;
   Img.TheImageKind = object::IMG_Object;
   Img.TheOffloadKind = object::OFK_OpenMP;
@@ -2477,25 +2678,56 @@ static bool Emit_OpenMP_Device_Image(Module *M, Function *E,
   Img.StringData["triple"] = "x86_64-pc-linux-gnu";
   Img.StringData["arch"] = "x86_64";
   Img.Image = std::move(SoBuf);
-  SmallString<0> Bytes = object::OffloadBinary::write(Img);
+  SmallString<0> ImageBytes = object::OffloadBinary::write(Img);
   sys::fs::remove(ObjPath);
   sys::fs::remove(SoPath);
-
-  // Host offload entry: the runtime matches the region id passed to
-  // __tgt_target_kernel with this entry and looks up the kernel by name.
-  auto EntriesB = offloading::getOffloadEntryArray(*M, "omp_offloading_entries");
-  offloading::emitOffloadingEntry(*M, object::OFK_OpenMP, RegionId, KernelName,
-                                  0, 0, 0, nullptr, "omp_offloading_entries");
-
-  SmallVector<ArrayRef<char>, 1> Images;
-  Images.push_back(ArrayRef<char>(Bytes.data(), Bytes.size()));
-  if (Error E2 = offloading::wrapOpenMPBinaries(*M, Images, EntriesB)) {
-    consumeError(std::move(E2));
-    return false;
-  }
+  Bytes.append(ImageBytes.begin(), ImageBytes.end());
   return true;
 }
 
+// Called once when the module is complete: one descriptor, one image per
+// device, and all kernels present in every image.
+extern "C" void Finalize_OpenMP_Images(Module *M) {
+  if (Pending_OMP_Regions.empty())
+    return;
+  Type *Ptr = PointerType::getUnqual(M->getContext());
+  // Only advertise kernels that will actually exist in the emitted images.
+  // A missing/renamed outlined function would otherwise produce an offload
+  // entry whose symbol cannot be loaded at runtime.
+  SmallVector<OMPRegion, 4> Regions;
+  for (const OMPRegion &R : Pending_OMP_Regions) {
+    Function *F = M->getFunction(R.EName);
+    if (!F || R.NArgs == 0 ||
+        F->getFunctionType()->getNumParams() != R.NArgs)
+      continue;
+    Regions.push_back(R);
+  }
+  Pending_OMP_Regions.clear();
+  if (Regions.empty())
+    return;
+
+  SmallString<0> HostBytes, NVPTXBytes;
+  bool HaveHost = Emit_OpenMP_Host_Image(M, Regions, HostBytes);
+  bool HaveNVPTX = Emit_OpenMP_NVPTX_Image(M, Regions, NVPTXBytes);
+  if (!HaveHost && !HaveNVPTX)
+    return;
+  auto EntriesB = offloading::getOffloadEntryArray(*M, "omp_offloading_entries");
+  offloading::emitOffloadingEntry(*M, object::OFK_OpenMP,
+                                  ConstantPointerNull::get(cast<PointerType>(Ptr)),
+                                  "", 0, 0x10, 0x008, nullptr,
+                                  "omp_offloading_entries");
+  for (const OMPRegion &R : Regions)
+    offloading::emitOffloadingEntry(*M, object::OFK_OpenMP, R.RegionId,
+                                    R.KernelName, 0, 0, 0, nullptr,
+                                    "omp_offloading_entries");
+  SmallVector<ArrayRef<char>, 2> Images;
+  if (HaveHost)
+    Images.push_back(ArrayRef<char>(HostBytes.data(), HostBytes.size()));
+  if (HaveNVPTX)
+    Images.push_back(ArrayRef<char>(NVPTXBytes.data(), NVPTXBytes.size()));
+  if (Error E = offloading::wrapOpenMPBinaries(*M, Images, EntriesB))
+    consumeError(std::move(E));
+}
 Constant *Get_OpenMP_Ident(Module *M) {
   if (GlobalVariable *G = M->getNamedGlobal("gnat.omp.ident"))
     return G;
@@ -2549,8 +2781,12 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
   Module *M = F->getParent();
 
   DominatorTree DT(*F);
-  LoopInfo LI(DT);
-  Loop *L = LI.getLoopFor(Header);
+  // Use an owning pointer so the analysis can be rebuilt from scratch after
+  // splitting the entry block.  Calling LoopInfo::analyze() on a live,
+  // already-populated analysis leaks/duplicates Loop objects and crashes in
+  // ~LoopInfo on scope exit (observed as a glibc "double free").
+  std::unique_ptr<LoopInfo> LI(new LoopInfo(DT));
+  Loop *L = LI->getLoopFor(Header);
   if (!L || L->getHeader() != Header)
     return 0;
   BasicBlock *Pre = L->getLoopPreheader();
@@ -2569,8 +2805,8 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
       return 0;
     Pre->splitBasicBlock(SplitAt, "omp.preheader");
     DT.recalculate(*F);
-    LI.analyze(DT);
-    L = LI.getLoopFor(Header);
+    LI.reset(new LoopInfo(DT));
+    L = LI->getLoopFor(Header);
     if (!L || L->getHeader() != Header)
       return 0;
     Pre = L->getLoopPreheader();
@@ -2641,24 +2877,83 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
 
   Instruction *Term = OPre->getTerminator();
 
-  // If the loop variable lives in the caller's frame it arrives as a pointer
-  // input and every thread would race on it.  Give each invocation a private
-  // induction variable instead.
-  if (auto *Arg = dyn_cast<Argument>(InitStore->getPointerOperand()))
-    if (Arg->getParent() == E) {
-      IRBuilder<> AB(&*E->getEntryBlock().getFirstInsertionPt());
-      AllocaInst *Private =
-          AB.CreateAlloca(Start->getType(), nullptr, "omp.private.iv");
-      Arg->replaceAllUsesWith(Private);
-    }
+  // Any pointer input that the extracted body stores to *directly* is a
+  // thread-private variable in the OpenMP sense -- typically a loop counter
+  // of a loop nested inside the parallel loop.  All invocations of the
+  // microtask receive the same argument pointers, so without private copies
+  // the threads race on the host's allocas (corrupted loop counters,
+  // out-of-bounds accesses, STORAGE_ERROR).  Writes *through* a pointer
+  // (array elements) are left alone: those identify shared storage.
+  DenseMap<Argument *, Type *> StoredArgTypes;
+  for (BasicBlock &BB : *E)
+    for (Instruction &I : BB)
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        if (auto *Arg = dyn_cast<Argument>(SI->getPointerOperand()))
+          if (Arg->getParent() == E)
+            StoredArgTypes[Arg] = SI->getValueOperand()->getType();
+
+  for (auto &KV : StoredArgTypes) {
+    Argument *Arg = KV.first;
+    IRBuilder<> AB(&*E->getEntryBlock().getFirstInsertionPt());
+    AllocaInst *Private =
+        AB.CreateAlloca(KV.second, nullptr, "omp.private");
+    // Copy in the caller's value before rebinding the uses.  Nested loop
+    // counters overwrite it in their initialization; other variables keep
+    // their incoming value.  The copy-in load must keep reading the original
+    // argument, so restore its operand after replaceAllUsesWith.
+    LoadInst *Copy = AB.CreateLoad(KV.second, Arg);
+    Arg->replaceAllUsesWith(Private);
+    Copy->setOperand(0, Arg);
+    AB.CreateStore(Copy, Private);
+  }
 
   // Compute this thread's subrange before the loop-variable initialization,
   // which itself uses the lower bound.
   Value *NumericLo = Reversed ? Last : Start;
   Value *NumericHi = Reversed ? Start : Last;
   Type *Ty = Start->getType();
-  Value *ThreadLo = Range_Call(M, false, NumericLo, NumericHi, Ty, InitStore);
-  Value *ThreadHi = Range_Call(M, true, NumericLo, NumericHi, Ty, InitStore);
+
+  // For forward target loops use a cyclic (strided) split: consecutive
+  // threads then access consecutive elements, which is what makes warp lanes
+  // coalesce on NVPTX.  This requires changing the loop increment from 1 to
+  // the team size; find that increment first and fall back to the contiguous
+  // split if the loop shape is not recognized.
+  BinaryOperator *LoopStep = nullptr;
+  bool UseStride = Is_Target && !Reversed && OLatch;
+  if (UseStride)
+    for (Instruction &I : *OLatch)
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        if (SI->getPointerOperand() == InitStore->getPointerOperand())
+          if (auto *AI = dyn_cast<BinaryOperator>(SI->getValueOperand()))
+            if (AI->getOpcode() == Instruction::Add)
+              if (auto *CI = dyn_cast<ConstantInt>(AI->getOperand(1)))
+              if (CI->isOne()) {
+                LoopStep = AI;
+                break;
+              }
+  if (!LoopStep)
+    UseStride = false;
+
+  Value *NumStep = nullptr;
+  if (UseStride) {
+    IRBuilder<> NB(InitStore);
+    FunctionCallee NumF = M->getOrInsertFunction(
+        "omp_get_num_threads", Type::getInt32Ty(M->getContext()));
+    Value *Num32 = NB.CreateCall(NumF);
+    Value *Num64 = NB.CreateSExt(Num32, Type::getInt64Ty(M->getContext()));
+    Value *Positive = NB.CreateICmpSGT(
+        Num64, ConstantInt::get(Type::getInt64Ty(M->getContext()), 0));
+    Value *Num = NB.CreateSelect(
+        Positive, Num64,
+        ConstantInt::get(Type::getInt64Ty(M->getContext()), 1));
+    NumStep = NB.CreateSExtOrTrunc(Num, Ty);
+    LoopStep->setOperand(1, NumStep);
+  }
+
+  Value *ThreadLo =
+      Range_Call(M, false, NumericLo, NumericHi, Ty, InitStore, UseStride);
+  Value *ThreadHi =
+      Range_Call(M, true, NumericLo, NumericHi, Ty, InitStore, UseStride);
 
   Value *InitVal = Reversed ? ThreadHi : ThreadLo;
   Value *LastVal = Reversed ? ThreadLo : ThreadHi;
@@ -2748,20 +3043,6 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
       ConstantInt::get(I8, 0), "gnat.omp.region.id." + Suffix);
   std::string KernelName = "gnat_omp_kernel_" + Suffix;
 
-  SmallVector<uint64_t, 8> MappedSizes;
-  bool SizesKnown = HostCall->arg_size() > 0;
-  for (Value *Arg : HostCall->args()) {
-    uint64_t S = Infer_Mapped_Size(Arg, M->getDataLayout());
-    if (S == 0)
-      SizesKnown = false;
-    MappedSizes.push_back(S);
-  }
-
-  if (!SizesKnown
-      || !Emit_OpenMP_Device_Image(M, E, RegionId, KernelName,
-                                   HostCall->arg_size()))
-    Ensure_OpenMP_Registration(M);
-
   unsigned NArgs = HostCall->arg_size();
   BasicBlock *Orig = HostCall->getParent();
   BasicBlock *Cont = Orig->splitBasicBlock(HostCall, "omp.target.cont");
@@ -2775,20 +3056,45 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
   AllocaInst *Sizes = B.CreateAlloca(I64Arr, nullptr, "omp.sizes");
   AllocaInst *MapT = B.CreateAlloca(I64Arr, nullptr, "omp.maptypes");
   Constant *Zero64 = ConstantInt::get(I64, 0);
-  unsigned Index = 0;
+  SmallVector<Value *, 8> MappedValues;
+  SmallVector<Value *, 8> MappedSizes;
+  bool SizesKnown = true;
   for (Value *Arg : HostCall->args()) {
+    Value *BaseVal = Arg;
+    Value *Size;
+    if (Arg->getType()->isPointerTy()) {
+      // Arrays and scalar addresses: map the whole object (VLAs included).
+      Size = Build_Mapped_Size(B, Arg, M->getDataLayout(), SizesKnown);
+    } else {
+      // By-value args are firstprivate on the device: map a 4-byte slot
+      // holding the value instead of treating the value as an address.
+      AllocaInst *Slot = B.CreateAlloca(Arg->getType(), nullptr, "omp.scalar");
+      B.CreateStore(Arg, Slot);
+      BaseVal = Slot;
+      Size = ConstantInt::get(
+          I64, M->getDataLayout().getTypeAllocSize(Arg->getType()));
+    }
+    MappedValues.push_back(BaseVal);
+    MappedSizes.push_back(Size);
+  }
+
+  for (unsigned Index = 0; Index < NArgs; ++Index) {
     Value *BP = B.CreateInBoundsGEP(PtrArr, Base,
                                     {B.getInt32(0), B.getInt32(Index)});
-    B.CreateStore(Arg, BP);
+    B.CreateStore(MappedValues[Index], BP);
     Value *SP = B.CreateInBoundsGEP(I64Arr, Sizes,
                                     {B.getInt32(0), B.getInt32(Index)});
-    B.CreateStore(ConstantInt::get(
-                      I64, SizesKnown ? MappedSizes[Index] : 0), SP);
+    B.CreateStore(SizesKnown ? MappedSizes[Index] : Zero64, SP);
     Value *MP = B.CreateInBoundsGEP(I64Arr, MapT,
                                     {B.getInt32(0), B.getInt32(Index)});
     B.CreateStore(ConstantInt::get(I64, SizesKnown ? 35 : 0), MP);
-    ++Index;
   }
+
+  // Without a known extent for every mapped object there is no safe device
+  // image.  Leave the region unregistered so __tgt_target_kernel reports a
+  // miss and the correct host fallback below executes.
+  if (SizesKnown && NArgs > 0)
+    Register_OpenMP_Target(M, E, RegionId, KernelName.c_str(), NArgs);
 
   ArrayType *Arr3 = ArrayType::get(I32, 3);
   StructType *ArgTy =
@@ -2810,19 +3116,46 @@ extern "C" unsigned Outline_Parallel_For(LLVMValueRef Header_Ref,
   B.CreateStore(Null, field_ptr(7));
   B.CreateStore(Zero64, field_ptr(8));
   B.CreateStore(Zero64, field_ptr(9));
-  Constant *Neg1Arr = ConstantArray::get(
-      Arr3, {ConstantInt::get(I32, -1), ConstantInt::get(I32, 0),
-             ConstantInt::get(I32, 0)});
-  B.CreateStore(Neg1Arr, field_ptr(10));
-  B.CreateStore(ConstantAggregateZero::get(Arr3), field_ptr(11));
+  B.CreateStore(ConstantInt::get(I32, 0), field_ptr(12));
+
+  Value *MaxSize = nullptr;
+  for (Value *Sz : MappedSizes)
+    MaxSize = MaxSize ? B.CreateSelect(B.CreateICmpSGT(Sz, MaxSize), Sz, MaxSize)
+                      : Sz;
+  if (!MaxSize)
+    MaxSize = ConstantInt::get(I64, 2048);
+  Value *Elems = B.CreateUDiv(MaxSize, ConstantInt::get(I64, 8));
+  Value *Teams64 = B.CreateUDiv(B.CreateAdd(Elems, ConstantInt::get(I64, 255)),
+                                ConstantInt::get(I64, 256));
+  Value *Teams = B.CreateTrunc(Teams64, I32);
+  // Large flat arrays (the 1-D stencil) need a grid proportional to the
+  // element count; smaller mapped objects are faster with a modest fixed
+  // grid (the nbody particle array and 2-D stencil case).
+  Value *Large = B.CreateICmpSGE(MaxSize, ConstantInt::get(I64, 4u * 1024 * 1024));
+  Value *FixedTeams = ConstantInt::get(I32, 64);
+  Teams = B.CreateSelect(Large, Teams, FixedTeams);
+  B.CreateStore(ConstantArray::get(
+                    Arr3, {ConstantInt::get(I32, 1), ConstantInt::get(I32, 1),
+                           ConstantInt::get(I32, 1)}),
+                field_ptr(10));
+  B.CreateStore(Teams,
+                B.CreateInBoundsGEP(Arr3, field_ptr(10),
+                                    {B.getInt32(0), B.getInt32(0)}));
+  B.CreateStore(ConstantArray::get(
+                    Arr3, {ConstantInt::get(I32, 256), ConstantInt::get(I32, 1),
+                           ConstantInt::get(I32, 1)}),
+                field_ptr(11));
   B.CreateStore(ConstantInt::get(I32, 0), field_ptr(12));
 
   FunctionCallee TgtKernel = M->getOrInsertFunction(
       "__tgt_target_kernel",
       FunctionType::get(I32, {Ptr, I64, I32, I32, Ptr, Ptr}, false));
+  // The runtime takes num_teams/thread_limit from these call arguments and
+  // overwrites the corresponding fields of KernelArgs, so they must match the
+  // grid the device kernel expects.
   Value *Ret = B.CreateCall(
       TgtKernel, {TgtIdent, ConstantInt::get(I64, -1),
-                  ConstantInt::get(I32, -1), ConstantInt::get(I32, 0),
+                  Teams, ConstantInt::get(I32, 256),
                   ConstantExpr::getBitCast(RegionId, Ptr), Args});
   Value *Fallback = B.CreateICmpNE(Ret, ConstantInt::get(I32, 0));
   BasicBlock *FB = BasicBlock::Create(Ctx, "omp.target.fallback", F);

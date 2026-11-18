@@ -1192,6 +1192,7 @@ package body GNATLLVM.Exprs is
       OpenMP_Num_Threads := 0;
       OpenMP_Simdlen := 0;
       OpenMP_Safelen := 0;
+      OpenMP_Has_Reduction := False;
 
       --  The first positional argument names the directive.
 
@@ -1234,6 +1235,8 @@ package body GNATLLVM.Exprs is
                elsif CName = "num_threads" then
                   OpenMP_Num_Threads :=
                     Nat (UI_To_Int (Expr_Value (Expression (Arg))));
+               elsif CName = "reduction" then
+                  OpenMP_Has_Reduction := True;
                end if;
             end;
          end if;

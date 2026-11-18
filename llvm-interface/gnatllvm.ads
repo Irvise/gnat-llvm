@@ -283,6 +283,9 @@ package GNATLLVM is
    OpenMP_Num_Threads  : Nat := 0;
    OpenMP_Simdlen      : Nat := 0;
    OpenMP_Safelen      : Nat := 0;
+   --  Reduction clauses are not lowered by the native GNAT-LLVM path yet;
+   --  keep such loops sequential instead of producing a wrong checksum.
+   OpenMP_Has_Reduction : Boolean := False;
 
    DI_Builder          : DI_Builder_T;
    --  The current LLVM Debug Info builder
@@ -447,6 +450,12 @@ package GNATLLVM is
    function Hash_BB (BB : Basic_Block_T) return Hash_Type is
      (Hash_Value (Basic_Block_As_Value (BB)))
      with Pre => Present (BB);
+
+   --  Emit all OpenMP device images and register them once the module is
+   --  complete.  One descriptor with all kernels avoids LLVM 21 crashes when
+   --  several target regions create separate offload descriptors.
+   procedure Finalize_OpenMP_Images (M : Module_T)
+     with Import, Convention => C, External_Name => "Finalize_OpenMP_Images";
 
    --  For use in child packages:
    pragma Warnings (Off);
