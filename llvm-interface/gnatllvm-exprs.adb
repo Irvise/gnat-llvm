@@ -25,6 +25,7 @@ with Opt;         use Opt;
 with Sem_Aggr;    use Sem_Aggr;
 with Sem_Eval;    use Sem_Eval;
 with Sem_Util;    use Sem_Util;
+with Ada.Environment_Variables;
 with Snames;      use Snames;
 with Stringt;     use Stringt;
 with System.Case_Util;
@@ -1184,9 +1185,20 @@ package body GNATLLVM.Exprs is
    -- Record_OpenMP_Pragma --
    --------------------------
 
+   --  GNAT_LLVM_NO_OPENMP builds a clean single-threaded baseline: pragma
+   --  OpenMP is ignored, so no loops are outlined and the program is plain
+   --  sequential Ada.
+   No_OpenMP : constant Boolean :=
+     Ada.Environment_Variables.Exists ("GNAT_LLVM_NO_OPENMP");
+
    procedure Record_OpenMP_Pragma (N : N_Pragma_Id) is
       Arg : Node_Id := First (Pragma_Argument_Associations (N));
    begin
+      if No_OpenMP then
+         OpenMP_Pending := False;
+         return;
+      end if;
+
       OpenMP_Pending := False;
       OpenMP_Directive := OpenMP_None;
       OpenMP_Num_Threads := 0;
